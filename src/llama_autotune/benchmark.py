@@ -97,11 +97,15 @@ def _parse_benchmark_output(output: str) -> dict | None:
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
 
+    last_result = None
     for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
             data = json.loads(line)
             if isinstance(data, dict):
-                return {
+                last_result = {
                     "prompt_tps": float(data.get("pp_avg", data.get("prompt_tps", 0))),
                     "generation_tps": float(data.get("tg_avg", data.get("generation_tps", 0))),
                     "memory_usage": float(data.get("mem_usage", data.get("memory_usage", 0))),
@@ -109,4 +113,4 @@ def _parse_benchmark_output(output: str) -> dict | None:
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
 
-    return None
+    return last_result
