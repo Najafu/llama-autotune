@@ -55,9 +55,9 @@ def is_plausible(config: SearchConfig, model: ModelInfo, hw: HardwareInfo) -> bo
 def detect_oom_in_output(output: str) -> bool:
     oom_patterns = [
         "out of memory",
-        "OOM",
-        "CUDA error",
-        "cudaMalloc",
+        "oom",
+        "cuda error",
+        "cudamalloc",
         "cannot allocate",
         "failed to allocate",
     ]

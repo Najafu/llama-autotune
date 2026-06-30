@@ -19,7 +19,7 @@ def generate_initial_config(hw: HardwareInfo, model: ModelInfo) -> SearchConfig:
 
 def _set_basics(config: SearchConfig, model: ModelInfo) -> None:
     config.flash_attn = True
-    config.gpu_layers = 999
+    config.n_gpu_layers = 999
     config.batch_size = 2048
     config.ubatch_size = 512
 
