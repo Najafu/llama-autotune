@@ -1,3 +1,10 @@
+"""SQLAlchemy ORM models and persistence helpers for llama-autotune.
+
+Defines the database schema (``HardwareProfileModel``, ``ModelProfileModel``,
+``BenchmarkModel``, ``LaunchProfileModel``) and convenience functions for
+storing and retrieving benchmark results and launch profiles.
+"""
+
 from __future__ import annotations
 
 import json
@@ -12,10 +19,16 @@ from .models import BenchmarkEntry, BenchmarkResult, LaunchProfile, SearchConfig
 
 
 class Base(DeclarativeBase):
+    """SQLAlchemy declarative base for all ORM models."""
     pass
 
 
 class HardwareProfileModel(Base):
+    """Persisted hardware profile entry.
+
+    Stores CPU/GPU topology, memory sizes, and backend type for a given
+    machine. Corresponds to the ``hardware_profiles`` table.
+    """
     __tablename__ = "hardware_profiles"
     id = Column(Integer, primary_key=True)
     cpu_name = Column(String)
@@ -30,6 +43,12 @@ class HardwareProfileModel(Base):
 
 
 class ModelProfileModel(Base):
+    """Persisted model profile entry.
+
+    Stores model architecture metadata such as parameter count,
+    quantization, layer/head counts, and file size. Corresponds to the
+    ``model_profiles`` table.
+    """
     __tablename__ = "model_profiles"
     id = Column(Integer, primary_key=True)
     path = Column(String, unique=True)
@@ -45,6 +64,12 @@ class ModelProfileModel(Base):
 
 
 class BenchmarkModel(Base):
+    """Persisted benchmark result entry.
+
+    Records a single benchmark run including throughput metrics, memory
+    usage, the configuration JSON, and the optimisation objective.
+    Corresponds to the ``benchmarks`` table.
+    """
     __tablename__ = "benchmarks"
     id = Column(Integer, primary_key=True)
     hardware_id = Column(String)
@@ -60,6 +85,11 @@ class BenchmarkModel(Base):
 
 
 class LaunchProfileModel(Base):
+    """Persisted launch-profile entry.
+
+    Stores a named profile with its CLI arguments, model path, hardware
+    description, and score. Corresponds to the ``launch_profiles`` table.
+    """
     __tablename__ = "launch_profiles"
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True)
@@ -71,12 +101,30 @@ class LaunchProfileModel(Base):
 
 
 def get_db_path() -> str:
+    """Return the default path for the SQLite benchmark database.
+
+    The database is stored at ``~/.llama-autotune/benchmarks.db``. The
+    parent directory is created if it does not exist.
+
+    Returns:
+        Absolute path to the database file.
+    """
     data_dir = os.path.join(Path.home(), ".llama-autotune")
     os.makedirs(data_dir, exist_ok=True)
     return os.path.join(data_dir, "benchmarks.db")
 
 
 def get_session(db_path: str | None = None) -> Session:
+    """Create and return a new SQLAlchemy session.
+
+    Ensures all tables exist before returning the session.
+
+    Args:
+        db_path: Path to the SQLite database. Defaults to ``get_db_path()``.
+
+    Returns:
+        An open SQLAlchemy ``Session``.
+    """
     if db_path is None:
         db_path = get_db_path()
     engine = create_engine(f"sqlite:///{db_path}")
@@ -85,6 +133,12 @@ def get_session(db_path: str | None = None) -> Session:
 
 
 def save_benchmark(session: Session, entry: BenchmarkEntry) -> None:
+    """Persist a benchmark entry to the database.
+
+    Args:
+        session: An active SQLAlchemy session.
+        entry: The benchmark entry to save.
+    """
     bm = BenchmarkModel(
         hardware_id=entry.hardware_id,
         model_id=entry.model_id,
@@ -102,6 +156,15 @@ def save_benchmark(session: Session, entry: BenchmarkEntry) -> None:
 
 
 def save_launch_profile(session: Session, profile: LaunchProfile) -> None:
+    """Upsert a launch profile into the database.
+
+    If a profile with the same name already exists its fields are updated;
+    otherwise a new row is inserted.
+
+    Args:
+        session: An active SQLAlchemy session.
+        profile: The launch profile to persist.
+    """
     existing = (
         session.query(LaunchProfileModel)
         .filter(LaunchProfileModel.name == profile.name)
@@ -128,6 +191,18 @@ def save_launch_profile(session: Session, profile: LaunchProfile) -> None:
 def get_best_benchmark(
     session: Session, model_id: str, objective: str
 ) -> BenchmarkModel | None:
+    """Retrieve the highest-scoring successful benchmark for a model/objective pair.
+
+    Results are ordered by generation tokens-per-second descending.
+
+    Args:
+        session: An active SQLAlchemy session.
+        model_id: The model identifier to match.
+        objective: The optimisation objective to match.
+
+    Returns:
+        The best ``BenchmarkModel`` row, or ``None`` if no matching entry exists.
+    """
     col = BenchmarkModel.generation_tps
     return (
         session.query(BenchmarkModel)

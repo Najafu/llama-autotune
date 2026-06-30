@@ -1,3 +1,15 @@
+"""Three-stage LLM inference parameter optimizer.
+
+Stage A — Rule-based baseline: evaluate the heuristic initial config; if it
+fails, try simple thread-count fallbacks.
+
+Stage B — Local grid search: sweep over the primary parameters (threads,
+batch_size, ubatch_size, n_gpu_layers) one at a time, keeping the best so far.
+
+Stage C — Bayesian optimisation: use Optuna's TPE sampler to explore the full
+search space around the best config found by the earlier stages.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -27,6 +39,13 @@ _SLOW_TIMEOUT = 15.0
 
 
 class Optimizer:
+    """Three-stage parameter optimizer for llama.cpp.
+
+    Sequences a heuristic baseline (stage A), a local grid search (stage B),
+    and a Bayesian optimisation pass (stage C) to find the best inference
+    parameters for a given model and hardware combination.
+    """
+
     def __init__(
         self,
         model_path: str,
@@ -36,6 +55,18 @@ class Optimizer:
         llama_dir: str | None = None,
         slow: bool = False,
     ):
+        """Initialise the optimizer.
+
+        Args:
+            model_path: Path to the GGUF model file.
+            objective: Optimisation objective (e.g. balanced, max throughput).
+            n_trials_stage_b: Maximum evaluations for the grid-search stage.
+            n_trials_stage_c: Maximum evaluations for the Bayesian stage.
+            llama_dir: Optional path to a custom llama.cpp directory. When set,
+                the ``LLAMA_CPP_DIR`` environment variable is updated.
+            slow: If True, fallback configs are tried even when the baseline is
+                too slow for the host machine.
+        """
         self.model_path = model_path
         self.objective = objective
         self.n_trials_stage_b = n_trials_stage_b
@@ -56,6 +87,16 @@ class Optimizer:
         self._cache: dict[str, BenchmarkResult] = {}
 
     def run(self) -> SearchConfig:
+        """Run all three optimisation stages and return the best config.
+
+        Stages are executed sequentially: baseline (A), then local search (B),
+        then Bayesian (C). If stage A fails completely and no fallback works,
+        the initial heuristic config is returned.
+
+        Returns:
+            The best SearchConfig found, or the initial heuristic config if
+            no successful evaluation was produced.
+        """
         logger.info(
             "Starting optimization",
             model=self.model_path,
@@ -80,6 +121,12 @@ class Optimizer:
         return self._best_config or self._initial_config
 
     def _stage_a_baseline(self) -> None:
+        """Evaluate the rule-based initial config.
+
+        If the config succeeds its score is recorded.  On failure the method
+        either bails out (when the benchmark is too slow and ``slow`` is
+        False) or falls through to the fallback configs.
+        """
         logger.info("Stage A: rule-based baseline")
         result = self._evaluate(self._initial_config, detect_slow=True)
         if result.success:
@@ -100,6 +147,11 @@ class Optimizer:
             self._try_fallback_configs()
 
     def _try_fallback_configs(self) -> None:
+        """Iterate generated fallback configs and use the first one that works.
+
+        Once a fallback succeeds it becomes the new best config and iteration
+        stops.
+        """
         for cfg in self._generate_fallbacks():
             result = self._evaluate(cfg)
             if result.success:
@@ -109,6 +161,15 @@ class Optimizer:
                 return
 
     def _generate_fallbacks(self) -> list[SearchConfig]:
+        """Build a list of fallback configurations.
+
+        Produces configs with varying thread counts (physical cores, logical
+        cores, half physical cores), first for the initial heuristic config
+        and then for a CPU-only variant.
+
+        Returns:
+            A list of fallback SearchConfig objects.
+        """
         fallbacks = []
         threads_opts = sorted({
             self.hw.physical_cores,
@@ -127,6 +188,13 @@ class Optimizer:
         return fallbacks
 
     def _stage_b_local_search(self) -> None:
+        """Local grid search over primary parameters.
+
+        Sweeps ``threads``, ``batch_size``, ``ubatch_size``, and
+        ``n_gpu_layers`` one parameter at a time, evaluating up to
+        ``n_trials_stage_b`` configs.  The best config is updated whenever a
+        higher-scoring combination is found.
+        """
         logger.info("Stage B: local grid search")
         space = get_search_space(self.hw, self.model, self.objective)
         primary_params = ["threads", "batch_size", "ubatch_size", "n_gpu_layers"]
@@ -161,6 +229,12 @@ class Optimizer:
                 evals += 1
 
     def _stage_c_bayesian(self) -> None:
+        """Bayesian optimisation over the full search space.
+
+        Uses Optuna with a TPE sampler (seed 42) for reproducibility.
+        Evaluates up to ``n_trials_stage_c`` configs and updates the best
+        config if the study finds a superior score.
+        """
         logger.info("Stage C: Bayesian optimization")
         space = get_search_space(self.hw, self.model, self.objective)
 
@@ -189,6 +263,16 @@ class Optimizer:
             logger.info("Bayesian improved", score=self._best_score)
 
     def _evaluate(self, config: SearchConfig, detect_slow: bool = False) -> BenchmarkResult:
+        """Run a benchmark for the given config, caching the result.
+
+        Args:
+            config: The configuration to evaluate.
+            detect_slow: When True a short timeout (15 s) is used to detect
+                whether the config is too slow for the host.
+
+        Returns:
+            A BenchmarkResult with timing and memory information.
+        """
         key = self._config_key(config)
         if key in self._cache:
             return self._cache[key]
@@ -205,6 +289,14 @@ class Optimizer:
         return result
 
     def _score(self, result: BenchmarkResult) -> float:
+        """Compute a scalar score from a benchmark result based on the objective.
+
+        Args:
+            result: The benchmark result to score.
+
+        Returns:
+            A numerical score (higher is better).
+        """
         if self.objective == OptimizeObjective.MAX_GENERATION_TPS:
             return result.generation_tps
         elif self.objective == OptimizeObjective.MAX_PROMPT_TPS:
@@ -219,6 +311,19 @@ class Optimizer:
             return result.generation_tps
 
     def _grid_values(self, param: ParamDef, count: int) -> list[Any]:
+        """Generate up to ``count`` evenly-spaced values for a parameter.
+
+        For categorical parameters the first ``count`` categories are
+        returned.  For numeric parameters with a step size the values are
+        produced by repeated addition; otherwise a uniform step is computed.
+
+        Args:
+            param: The parameter definition.
+            count: Maximum number of values to return.
+
+        Returns:
+            A list of parameter values to evaluate.
+        """
         if param.is_categorical and param.categories:
             return param.categories[:count]
         if param.step:
@@ -234,6 +339,19 @@ class Optimizer:
     def _sample_param(
         self, trial: optuna.Trial, name: str, pdef: ParamDef
     ) -> Any:
+        """Sample a parameter value for an Optuna trial.
+
+        Delegates to the appropriate ``suggest_*`` method based on whether the
+        parameter is categorical or integer-valued.
+
+        Args:
+            trial: The Optuna trial object.
+            name: The parameter name.
+            pdef: The parameter definition from the search space.
+
+        Returns:
+            A sampled value for the parameter.
+        """
         if pdef.is_categorical and pdef.categories:
             return trial.suggest_categorical(name, pdef.categories)
         if pdef.step:
@@ -241,16 +359,40 @@ class Optimizer:
         return trial.suggest_int(name, pdef.low, pdef.high)
 
     def _config_key(self, config: SearchConfig) -> str:
+        """Return a deterministic cache key for a config.
+
+        Args:
+            config: The search configuration.
+
+        Returns:
+            A JSON string uniquely representing the config.
+        """
         return config.model_dump_json()
 
     @property
     def best_config(self) -> SearchConfig | None:
+        """Return the best configuration found so far.
+
+        Returns:
+            The best SearchConfig, or None if no successful evaluation has
+            been performed.
+        """
         return self._best_config
 
     @property
     def best_score(self) -> float:
+        """Return the score of the best configuration.
+
+        Returns:
+            The score associated with ``best_config`` (0.0 if none).
+        """
         return self._best_score
 
     @property
     def total_evals(self) -> int:
+        """Return the total number of benchmark evaluations performed.
+
+        Returns:
+            The cumulative evaluation count across all stages.
+        """
         return self._total_evals

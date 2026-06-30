@@ -1,3 +1,10 @@
+"""Inspect GGUF model files and extract metadata.
+
+Reads the header key-value store from GGUF-format model files and
+resolves structured information such as architecture, quantization type,
+parameter count, and layer count into a ModelInfo object.
+"""
+
 from __future__ import annotations
 
 import os
@@ -49,6 +56,16 @@ _KNOWN_FILE_TYPES: dict[int, str] = {
 
 
 def inspect_model(path: str | Path) -> ModelInfo:
+    """Inspect a GGUF model file and return its metadata.
+
+    Args:
+        path: Path to the GGUF model file.
+
+    Returns:
+        A ModelInfo instance populated with file size, architecture,
+        quantization, parameter count, layer count, head count,
+        context length, and MoE details (if applicable).
+    """
     path = str(path)
     info = ModelInfo()
     info.path = path
@@ -77,6 +94,19 @@ def inspect_model(path: str | Path) -> ModelInfo:
 
 
 def _resolve_file_type(kv: dict) -> str:
+    """Resolve the quantization / file-type string from GGUF metadata.
+
+    Tries the integer ``general.file_type`` key first, then falls back
+    to scanning ``general.name`` for known type substrings
+    (e.g. ``Q4_0``, ``F16``).  Returns ``"unknown"`` if nothing
+    matches.
+
+    Args:
+        kv: The GGUF header key-value dictionary.
+
+    Returns:
+        A string such as ``"Q4_0"``, ``"F16"``, or ``"unknown"``.
+    """
     raw = _get_int(kv, "general.file_type", default=-1)
     if raw in _KNOWN_FILE_TYPES:
         return _KNOWN_FILE_TYPES[raw]
@@ -90,6 +120,18 @@ def _resolve_file_type(kv: dict) -> str:
 
 
 def _resolve_param_count(kv: dict) -> int:
+    """Resolve the parameter count from GGUF metadata.
+
+    Reads ``general.parameter_count`` first.  If it is zero, attempts
+    to parse a human-friendly label such as ``"7B"`` or ``"70M"`` from
+    ``general.size_label``.
+
+    Args:
+        kv: The GGUF header key-value dictionary.
+
+    Returns:
+        The number of parameters as an integer, or ``0`` if unresolvable.
+    """
     count = _get_int(kv, "general.parameter_count", default=0)
     if count > 0:
         return count
@@ -108,6 +150,18 @@ def _resolve_param_count(kv: dict) -> int:
 
 
 def _resolve_block_count(kv: dict, arch: str) -> int:
+    """Resolve the number of transformer blocks (layers) for an architecture.
+
+    Checks ``{arch}.block_count`` first, with a fallback to the legacy
+    ``llama.block_count`` key.
+
+    Args:
+        kv: The GGUF header key-value dictionary.
+        arch: The model architecture name (e.g. ``"llama"``).
+
+    Returns:
+        The number of layers, or ``0`` if not found.
+    """
     count = _get_int(kv, f"{arch}.block_count", default=0)
     if count == 0:
         count = _get_int(kv, "llama.block_count", default=0)
@@ -115,6 +169,17 @@ def _resolve_block_count(kv: dict, arch: str) -> int:
 
 
 def _read_gguf_header(path: str) -> dict[str, object]:
+    """Read the GGUF header key-value store from a file.
+
+    Args:
+        path: The filesystem path to the GGUF file.
+
+    Returns:
+        A dictionary mapping string keys to parsed values (strings,
+        integers, floats, booleans, or lists thereof).  Returns an
+        empty dict if the file does not start with a valid GGUF magic
+        number.
+    """
     kv: dict[str, object] = {}
     with open(path, "rb") as f:
         magic = f.read(4)
@@ -134,11 +199,36 @@ def _read_gguf_header(path: str) -> dict[str, object]:
 
 
 def _read_string(f) -> str:
+    """Read a GGUF string from a binary stream.
+
+    A GGUF string is stored as an 8-byte little-endian length followed
+    by that many UTF-8 bytes.
+
+    Args:
+        f: An open binary file handle positioned at the start of the
+           string.
+
+    Returns:
+        The decoded string.
+    """
     length = struct.unpack("<Q", f.read(8))[0]
     return f.read(length).decode("utf-8", errors="replace")
 
 
 def _read_value(f) -> object:
+    """Read a single GGUF key-value value from a binary stream.
+
+    The first four bytes indicate the value type; the subsequent bytes
+    are interpreted according to that type.
+
+    Args:
+        f: An open binary file handle positioned at the start of the
+           value.
+
+    Returns:
+        The parsed Python object (``int``, ``float``, ``bool``,
+        ``str``, ``list``, or ``None`` for unknown types).
+    """
     val_type = struct.unpack("<I", f.read(4))[0]
 
     if val_type == GGUF_TYPE_UINT8:
@@ -177,6 +267,18 @@ def _read_value(f) -> object:
 
 
 def _read_value_with_type(f, val_type: int) -> object:
+    """Read a GGUF value whose type is already known.
+
+    Unlike :func:`_read_value`, this function does **not** consume the
+    type tag from the stream; the caller provides the type code.
+
+    Args:
+        f: An open binary file handle.
+        val_type: One of the ``GGUF_TYPE_*`` constants.
+
+    Returns:
+        The parsed Python object, or ``None`` for unrecognised types.
+    """
     if val_type == GGUF_TYPE_STRING:
         return _read_string(f)
     elif val_type == GGUF_TYPE_UINT8:
@@ -205,6 +307,16 @@ def _read_value_with_type(f, val_type: int) -> object:
 
 
 def _get_str(kv: dict, key: str) -> str:
+    """Safely retrieve a string value from the GGUF key-value store.
+
+    Args:
+        kv: The GGUF header key-value dictionary.
+        key: The lookup key.
+
+    Returns:
+        The value as a string, or ``""`` if the key is missing or
+        ``None``.
+    """
     val = kv.get(key)
     if val is None:
         return ""
@@ -214,6 +326,17 @@ def _get_str(kv: dict, key: str) -> str:
 
 
 def _get_int(kv: dict, key: str, default: int = 0) -> int:
+    """Safely retrieve an integer value from the GGUF key-value store.
+
+    Args:
+        kv: The GGUF header key-value dictionary.
+        key: The lookup key.
+        default: Value to return if the key is missing or cannot be
+                 converted to ``int``.
+
+    Returns:
+        The value as an integer, or *default*.
+    """
     val = kv.get(key)
     if val is None:
         return default

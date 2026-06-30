@@ -1,3 +1,10 @@
+"""CLI interface for llama-autotune.
+
+Provides commands for inspecting hardware/model info, running benchmarks,
+auto-optimizing configuration via search, launching llama-server with tuned
+settings, and exporting/importing launch profiles.
+"""
+
 from __future__ import annotations
 
 import json
@@ -55,6 +62,18 @@ Examples:
 def inspect(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
 ):
+    """Inspect hardware capabilities and model metadata.
+
+    Detects system hardware (CPU, GPU, RAM) and reads model properties
+    (architecture, parameter count, quantization, etc.) from a GGUF file,
+    displaying both in formatted tables.
+
+    Args:
+        model: Path to GGUF model file.
+
+    Returns:
+        None.
+    """
     hw = detect_hardware()
     model_info = inspect_model(model)
 
@@ -96,6 +115,27 @@ def benchmark(
     repetitions: int = typer.Option(3, "-r", "--repetitions", help="Benchmark repetitions"),
     output_file: Optional[str] = typer.Option(None, "-o", "--output", help="Save result to file"),
 ):
+    """Run a benchmark with optional custom parameters.
+
+    When explicit parameters are supplied those values are used directly;
+    otherwise a heuristic configuration is generated from the detected
+    hardware and model. Results are displayed in a table and persisted to
+    the local database. Optionally writes raw results to a JSON file.
+
+    Args:
+        model: Path to GGUF model file.
+        threads: CPU threads to use.
+        batch_size: Batch size for prompt processing.
+        ubatch_size: Micro-batch size.
+        n_gpu_layers: Number of layers to offload to GPU.
+        flash_attn: Enable or disable flash attention.
+        ctx_size: Context size.
+        repetitions: Number of benchmark repetitions.
+        output_file: Optional path to save result JSON.
+
+    Returns:
+        None.
+    """
     hw = detect_hardware()
     model_info = inspect_model(model)
 
@@ -157,6 +197,24 @@ def search(
         None, "--profile", "-p", help="Save best profile to file"
     ),
 ):
+    """Auto-optimize configuration via 3-stage search.
+
+    Runs a multi-stage optimisation using the Optimizer to find the best
+    llama.cpp parameters for the given objective (e.g. prompt throughput,
+    generation speed, or balanced). Displays hardware, model, and the best
+    configuration found. Optionally exports a reusable launch profile.
+
+    Args:
+        model: Path to GGUF model file.
+        objective: Optimization objective (balanced, max_prompt_tps,
+            max_generation_tps, min_memory).
+        trials_b: Number of trials for stage B (coarse search).
+        trials_c: Number of trials for stage C (fine search).
+        output_profile: Optional path to save best profile JSON.
+
+    Returns:
+        None.
+    """
     try:
         obj = OptimizeObjective(objective)
     except ValueError:
@@ -251,6 +309,22 @@ def launch(
     host: str = typer.Option("127.0.0.1", "--host", help="Server host"),
     port: int = typer.Option(8080, "--port", help="Server port"),
 ):
+    """Start llama-server with optimal configuration.
+
+    If a profile path is provided its arguments are used; otherwise a
+    heuristic configuration is generated from hardware detection and model
+    inspection. The server is launched via os.execvp, replacing the current
+    process.
+
+    Args:
+        model: Path to GGUF model file.
+        profile: Optional path to a saved profile JSON.
+        host: Server host address.
+        port: Server port number.
+
+    Returns:
+        None (the current process is replaced by llama-server).
+    """
     if profile:
         prof = import_profile(profile)
         args = prof.args
@@ -278,6 +352,20 @@ def export(
     hardware: str = typer.Option("", "--hardware", help="Hardware description"),
     score: float = typer.Option(0.0, "--score", help="Profile score"),
 ):
+    """Export a launch profile to JSON.
+
+    Creates a profile with the given metadata and writes it to a JSON file
+    that can later be imported for launching or sharing.
+
+    Args:
+        profile: Profile name or file path to save.
+        model: Model path to embed in the profile.
+        hardware: Hardware description string.
+        score: Optional profile quality score.
+
+    Returns:
+        None.
+    """
     prof = create_profile(
         name=Path(profile).stem if Path(profile).suffix else profile,
         args=[],
@@ -293,6 +381,17 @@ def export(
 def import_cmd(
     profile: str = typer.Argument(..., help="Path to profile JSON"),
 ):
+    """Import a launch profile from JSON.
+
+    Reads a previously exported profile file and displays its contents
+    (model path, hardware, arguments, and score) in a formatted table.
+
+    Args:
+        profile: Path to profile JSON file.
+
+    Returns:
+        None.
+    """
     prof = import_profile(profile)
     table = Table(title=f"Profile: {prof.name}", box=box.ROUNDED)
     table.add_column("Field", style="cyan")
@@ -308,6 +407,17 @@ def import_cmd(
 def main_callback(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
 ):
+    """Configure global logging for the CLI.
+
+    Called automatically by Typer before any command runs. Sets the logging
+    level to DEBUG when --verbose is passed, otherwise defaults to WARNING.
+
+    Args:
+        verbose: Enable verbose DEBUG-level logging.
+
+    Returns:
+        None.
+    """
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(
         level=level,

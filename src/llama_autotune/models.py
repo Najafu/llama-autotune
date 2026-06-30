@@ -1,3 +1,10 @@
+"""Pydantic data models for the llama-autotune domain.
+
+Defines all structured data types used throughout the codebase:
+hardware profiles, model metadata, benchmark results, search
+configurations, and launch profiles.
+"""
+
 from __future__ import annotations
 
 from enum import Enum
@@ -7,6 +14,8 @@ from pydantic import BaseModel, Field
 
 
 class Backend(str, Enum):
+    """Supported llama.cpp compute backends."""
+
     CUDA = "cuda"
     ROCM = "rocm"
     VULKAN = "vulkan"
@@ -15,6 +24,8 @@ class Backend(str, Enum):
 
 
 class GpuVendor(str, Enum):
+    """GPU manufacturer identifiers for hardware detection."""
+
     NVIDIA = "nvidia"
     AMD = "amd"
     INTEL = "intel"
@@ -23,6 +34,12 @@ class GpuVendor(str, Enum):
 
 
 class OptimizeObjective(str, Enum):
+    """Optimization objectives the search can target.
+
+    Each objective tunes the search toward a different performance
+    characteristic (generation speed, prompt processing, latency, etc.).
+    """
+
     MAX_GENERATION_TPS = "max_generation_tps"
     MAX_PROMPT_TPS = "max_prompt_tps"
     MIN_LATENCY = "min_latency"
@@ -32,6 +49,8 @@ class OptimizeObjective(str, Enum):
 
 
 class SplitMode(str, Enum):
+    """Multi-GPU split modes supported by llama.cpp."""
+
     NONE = "none"
     LAYER = "layer"
     ROW = "row"
@@ -39,6 +58,11 @@ class SplitMode(str, Enum):
 
 
 class HardwareInfo(BaseModel):
+    """Detected hardware profile of the current machine.
+
+    Populated by :func:`llama_autotune.hardware.detect_hardware`.
+    """
+
     cpu_name: str = ""
     physical_cores: int = 0
     logical_cores: int = 0
@@ -51,6 +75,11 @@ class HardwareInfo(BaseModel):
 
 
 class ModelInfo(BaseModel):
+    """Metadata extracted from a GGUF model file.
+
+    Populated by :func:`llama_autotune.model_inspector.inspect_model`.
+    """
+
     path: str = ""
     architecture: str = ""
     parameters: int = 0
@@ -64,6 +93,8 @@ class ModelInfo(BaseModel):
 
 
 class BenchmarkResult(BaseModel):
+    """Result of a single llama-bench run."""
+
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     startup_time: float = 0.0
@@ -73,6 +104,13 @@ class BenchmarkResult(BaseModel):
 
 
 class SearchConfig(BaseModel):
+    """A full set of llama.cpp parameters to benchmark or launch with.
+
+    Every field is optional (None = use llama.cpp's default). Use
+    :meth:`to_bench_args` for llama-bench and :meth:`to_llama_args`
+    for llama-server.
+    """
+
     threads: int | None = None
     threads_batch: int | None = None
     batch_size: int | None = None
@@ -93,6 +131,14 @@ class SearchConfig(BaseModel):
     no_kv_offload: bool | None = None
 
     def to_bench_args(self) -> list[str]:
+        """Convert to command-line arguments for ``llama-bench``.
+
+        Only includes flags that ``llama-bench`` actually accepts
+        (omits context size, numa, mlock, etc.).
+
+        Returns:
+            List of CLI arguments.
+        """
         args = []
         if self.threads is not None:
             args.extend(["-t", str(self.threads)])
@@ -121,6 +167,14 @@ class SearchConfig(BaseModel):
         return args
 
     def to_llama_args(self) -> list[str]:
+        """Convert to command-line arguments for ``llama-server``.
+
+        Extends :meth:`to_bench_args` with server-specific flags
+        like context size, numa, and parallel.
+
+        Returns:
+            List of CLI arguments.
+        """
         args = self.to_bench_args()
         if self.ctx_size is not None:
             args.extend(["-c", str(self.ctx_size)])
@@ -136,6 +190,8 @@ class SearchConfig(BaseModel):
 
 
 class BenchmarkEntry(BaseModel):
+    """A single benchmark record stored in the SQLite database."""
+
     hardware_id: str = ""
     model_id: str = ""
     config: SearchConfig = Field(default_factory=SearchConfig)
@@ -145,6 +201,8 @@ class BenchmarkEntry(BaseModel):
 
 
 class LaunchProfile(BaseModel):
+    """A reusable launch profile exported to or imported from JSON."""
+
     name: str = ""
     args: list[str] = []
     model_path: str = ""

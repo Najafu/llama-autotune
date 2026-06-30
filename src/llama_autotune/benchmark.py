@@ -1,3 +1,9 @@
+"""Subprocess wrapper around llama-bench.
+
+Provides functions to locate the llama-bench executable, run benchmarks
+against a given model, and parse the JSON output into structured results.
+"""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +16,16 @@ from .models import BenchmarkResult, SearchConfig
 
 
 def find_llama_bench() -> str:
+    """Locate the llama-bench.exe executable.
+
+    Checks the ``LLAMA_CPP_DIR`` environment variable first, then falls
+    back to several relative paths derived from the current file's
+    location.  Returns the first existing file found.
+
+    Returns:
+        Absolute path to llama-bench.exe, or ``"llama-bench.exe"`` as a
+        last resort if none of the candidates exist.
+    """
     candidates = [
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "llama-bench.exe"),
         os.path.join(os.path.dirname(__file__), "..", "..", "llama-bench.exe"),
@@ -30,6 +46,24 @@ def run_benchmark(
     repetitions: int = 3,
     timeout: int = 300,
 ) -> BenchmarkResult:
+    """Execute llama-bench for a given model and return the results.
+
+    Runs the benchmark subprocess with the specified model, optional
+    configuration, and number of repetitions.  The output is parsed from
+    JSON and written into a ``BenchmarkResult`` instance.
+
+    Args:
+        model_path: Path to the model file to benchmark.
+        config: Optional ``SearchConfig`` whose extra arguments are
+            appended to the command line.
+        repetitions: Number of benchmark repetitions (passed via ``-r``).
+        timeout: Maximum time in seconds to wait for the subprocess.
+
+    Returns:
+        A ``BenchmarkResult`` with ``success`` set to ``True`` on
+        success, or ``False`` with error details in ``raw_output`` on
+        failure.
+    """
     result = BenchmarkResult()
 
     bench_path = find_llama_bench()
@@ -80,6 +114,20 @@ def run_benchmark(
 
 
 def _parse_benchmark_output(output: str) -> dict | None:
+    """Parse the JSON output from llama-bench into a flat dictionary.
+
+    Handles both a single JSON object and a JSON array (uses the last
+    entry).  Falls back to line-by-line JSONL parsing if top-level
+    parsing fails.
+
+    Args:
+        output: The raw stdout text from llama-bench.
+
+    Returns:
+        A dictionary with keys ``prompt_tps``, ``generation_tps``, and
+        ``memory_usage``, or ``None`` if no valid data could be
+        extracted.
+    """
     try:
         data = json.loads(output)
         if isinstance(data, list) and len(data) > 0:

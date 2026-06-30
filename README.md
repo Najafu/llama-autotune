@@ -19,11 +19,43 @@ llama-autotune search model.gguf --objective max_generation_tps
 
 ## Installation
 
-Requires Python 3.12+ and `uv`.
+### Prerequisites
+
+- Python 3.12+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) built binaries (`llama-bench.exe`, `llama-server.exe`)
+- `uv` (recommended) or `pip`
+
+### Option 1: Install from source (recommended)
 
 ```bash
+git clone https://github.com/YOUR_USER/llama-autotune.git
 cd llama-autotune
 uv sync
+```
+
+### Option 2: Install directly from GitHub
+
+```bash
+pip install git+https://github.com/YOUR_USER/llama-autotune.git
+```
+
+### Setting up llama.cpp
+
+The tool needs `llama-bench.exe` and `llama-server.exe` in your PATH, or set the `LLAMA_CPP_DIR` environment variable:
+
+```bash
+# Linux / macOS
+export LLAMA_CPP_DIR=/path/to/llama.cpp/build
+
+# Windows (PowerShell)
+$env:LLAMA_CPP_DIR = "C:\path\to\llamacpp"
+```
+
+### Verify installation
+
+```bash
+llama-autotune --help
+llama-autotune inspect path/to/model.gguf
 ```
 
 ## Usage
@@ -79,6 +111,20 @@ llama-autotune import profile.json
 |----------|---------|-------------|
 | `LLAMA_CPP_DIR` | parent of tool directory | Path to `llama-bench.exe` / `llama-server.exe` |
 
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| typer | CLI framework |
+| pydantic | Data validation |
+| rich | Terminal output |
+| sqlalchemy | Database ORM |
+| gguf | GGUF model parser |
+| optuna | Bayesian optimization |
+| psutil | Hardware detection |
+| structlog | Logging |
+| pyyaml | Config files |
+
 ## Project Structure
 
 ```
@@ -108,6 +154,14 @@ Hardware Probe → GGUF Inspector → Config Generator → Benchmark Engine → 
 ```bash
 uv run pytest -v
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+## Contributing
+
+PRs welcome. Please run tests (`uv run pytest`) before submitting and match the existing code style (Google-style docstrings, full type annotations).
 
 ## Roadmap
 

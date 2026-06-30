@@ -1,3 +1,11 @@
+"""Cross-platform hardware detection.
+
+Detects CPU (cores, name), RAM, and GPU (vendor, model, VRAM) using
+platform-native tools: WMI on Windows, nvidia-smi / rocm-smi on Linux,
+system_profiler on macOS. Falls back to ``llama-bench --list-devices``
+to verify that detected GPUs are actually usable by llama.cpp.
+"""
+
 from __future__ import annotations
 
 import os
@@ -12,6 +20,14 @@ from .models import Backend, GpuVendor, HardwareInfo
 
 
 def detect_hardware() -> HardwareInfo:
+    """Detect all hardware on the current machine.
+
+    Gathers CPU, RAM, and GPU information, then verifies that any
+    detected GPU backend is actually usable by llama.cpp.
+
+    Returns:
+        A populated :class:`HardwareInfo` instance.
+    """
     info = HardwareInfo()
 
     _detect_cpu(info)
@@ -24,12 +40,20 @@ def detect_hardware() -> HardwareInfo:
 
 
 def _detect_cpu(info: HardwareInfo) -> None:
+    """Populate CPU name, physical core count, and logical core count."""
     info.physical_cores = psutil.cpu_count(logical=False) or 0
     info.logical_cores = psutil.cpu_count(logical=True) or 0
     info.cpu_name = _get_cpu_name()
 
 
 def _get_cpu_name() -> str:
+    """Retrieve the CPU model name via platform-specific commands.
+
+    Uses PowerShell (Windows), lscpu (Linux), or sysctl (macOS).
+
+    Returns:
+        CPU model string, or fallback from ``platform.processor()``.
+    """
     if sys.platform == "win32":
         try:
             output = subprocess.check_output(
@@ -68,11 +92,13 @@ def _get_cpu_name() -> str:
 
 
 def _detect_ram(info: HardwareInfo) -> None:
+    """Populate total system RAM in gigabytes."""
     mem = psutil.virtual_memory()
     info.ram_gb = round(mem.total / (1024**3), 1)
 
 
 def _detect_gpu(info: HardwareInfo) -> None:
+    """Detect GPU(s) by dispatching to the platform-specific detector."""
     if sys.platform == "win32":
         _detect_gpu_windows(info)
     elif sys.platform == "linux":
@@ -82,6 +108,7 @@ def _detect_gpu(info: HardwareInfo) -> None:
 
 
 def _detect_gpu_windows(info: HardwareInfo) -> None:
+    """Enumerate GPUs via WMI (Win32_VideoController)."""
     try:
         output = subprocess.check_output(
             [
@@ -115,6 +142,7 @@ def _detect_gpu_windows(info: HardwareInfo) -> None:
 
 
 def _detect_gpu_linux(info: HardwareInfo) -> None:
+    """Enumerate GPUs via nvidia-smi and rocm-smi on Linux."""
     try:
         output = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
@@ -164,6 +192,7 @@ def _detect_gpu_linux(info: HardwareInfo) -> None:
 
 
 def _detect_gpu_macos(info: HardwareInfo) -> None:
+    """Enumerate GPUs via system_profiler on macOS."""
     try:
         output = subprocess.check_output(
             ["system_profiler", "SPDisplaysDataType"],
@@ -182,6 +211,14 @@ def _detect_gpu_macos(info: HardwareInfo) -> None:
 
 
 def _classify_gpu(name: str) -> GpuVendor:
+    """Classify a GPU vendor by keyword matching on its name string.
+
+    Args:
+        name: GPU model name from the OS.
+
+    Returns:
+        The matching :class:`GpuVendor`, or UNKNOWN.
+    """
     name_lower = name.lower()
     if any(x in name_lower for x in ["nvidia", "geforce", "rtx", "gtx", "tesla", "quadro"]):
         return GpuVendor.NVIDIA
@@ -195,6 +232,7 @@ def _classify_gpu(name: str) -> GpuVendor:
 
 
 def _determine_backend(info: HardwareInfo) -> None:
+    """Map GPU vendor to a llama.cpp backend string."""
     if info.gpu_vendor == GpuVendor.NVIDIA:
         info.backend = Backend.CUDA
     elif info.gpu_vendor == GpuVendor.AMD:
@@ -208,10 +246,16 @@ def _determine_backend(info: HardwareInfo) -> None:
 
 
 def _verify_gpu_backend(info: HardwareInfo) -> None:
+    """Cross-check GPU backend against ``llama-bench --list-devices``.
+
+    If llama-bench reports no usable GPU devices, forces the backend
+    to CPU to avoid generating invalid GPU configurations.
+    """
     if info.backend == Backend.CPU:
         return
     try:
         from .benchmark import find_llama_bench
+
         bench_path = find_llama_bench()
         result = subprocess.run(
             [bench_path, "--list-devices"],
