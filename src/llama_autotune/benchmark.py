@@ -37,7 +37,7 @@ def run_benchmark(
 
     cmd = [bench_path, "-m", model_path, "-r", str(repetitions), "-o", "json"]
     if config is not None:
-        cmd.extend(config.to_llama_args())
+        cmd.extend(config.to_bench_args())
 
     try:
         start = time.time()

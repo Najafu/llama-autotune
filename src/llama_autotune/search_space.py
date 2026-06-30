@@ -36,7 +36,9 @@ def _cpu_space(
     hw: HardwareInfo, model: ModelInfo, objective: OptimizeObjective
 ) -> dict[str, ParamDef]:
     space = {}
-    space["threads"] = ParamDef("threads", 4, hw.physical_cores, step=2)
+    min_threads = min(4, hw.physical_cores)
+    step = 1 if hw.physical_cores <= 4 else 2
+    space["threads"] = ParamDef("threads", min_threads, hw.physical_cores, step=step)
     return space
 
 

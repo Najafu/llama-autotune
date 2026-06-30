@@ -18,6 +18,7 @@ def detect_hardware() -> HardwareInfo:
     _detect_ram(info)
     _detect_gpu(info)
     _determine_backend(info)
+    _verify_gpu_backend(info)
 
     return info
 
@@ -204,3 +205,23 @@ def _determine_backend(info: HardwareInfo) -> None:
         info.backend = Backend.METAL
     else:
         info.backend = Backend.CPU
+
+
+def _verify_gpu_backend(info: HardwareInfo) -> None:
+    if info.backend == Backend.CPU:
+        return
+    try:
+        from .benchmark import find_llama_bench
+        bench_path = find_llama_bench()
+        result = subprocess.run(
+            [bench_path, "--list-devices"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if "none" in result.stdout.lower() and "gpu" not in result.stdout.lower():
+            info.backend = Backend.CPU
+            info.gpu_count = 0
+            info.gpu_models = []
+            info.vram_per_gpu = []
+    except Exception:
+        pass

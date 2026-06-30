@@ -92,7 +92,7 @@ class SearchConfig(BaseModel):
     parallel: int | None = None
     no_kv_offload: bool | None = None
 
-    def to_llama_args(self) -> list[str]:
+    def to_bench_args(self) -> list[str]:
         args = []
         if self.threads is not None:
             args.extend(["-t", str(self.threads)])
@@ -102,8 +102,6 @@ class SearchConfig(BaseModel):
             args.extend(["-b", str(self.batch_size)])
         if self.ubatch_size is not None:
             args.extend(["-ub", str(self.ubatch_size)])
-        if self.ctx_size is not None:
-            args.extend(["-c", str(self.ctx_size)])
         if self.n_gpu_layers is not None:
             args.extend(["-ngl", str(self.n_gpu_layers)])
         if self.flash_attn is not None:
@@ -115,11 +113,17 @@ class SearchConfig(BaseModel):
         if self.main_gpu is not None:
             args.extend(["-mg", str(self.main_gpu)])
         if self.cache_type_k is not None:
-            args.extend(["--cache-type-k", self.cache_type_k])
+            args.extend(["-ctk", self.cache_type_k])
         if self.cache_type_v is not None:
-            args.extend(["--cache-type-v", self.cache_type_v])
+            args.extend(["-ctv", self.cache_type_v])
         if self.mmap is not None:
             args.extend(["-mmp", "1" if self.mmap else "0"])
+        return args
+
+    def to_llama_args(self) -> list[str]:
+        args = self.to_bench_args()
+        if self.ctx_size is not None:
+            args.extend(["-c", str(self.ctx_size)])
         if self.mlock is not None:
             args.extend(["--mlock"])
         if self.numa is not None:

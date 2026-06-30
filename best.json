@@ -1,0 +1,21 @@
+{
+  "name": "Intel(R)_Celeron(R)_CPU__N2840__@_2.16GHz_qwen2_balanced",
+  "args": [
+    "-t",
+    "2",
+    "-b",
+    "512",
+    "-ub",
+    "256",
+    "-c",
+    "4096",
+    "-ngl",
+    "0",
+    "-fa",
+    "0"
+  ],
+  "model_path": "C:\\llamacpp\\models\\qwen\\Qwen2.5-0.5B-OBLITERATED.IQ4_XS.gguf",
+  "hardware": "Intel(R) Celeron(R) CPU  N2840  @ 2.16GHz",
+  "created": "2026-06-30T01:04:50.039982+00:00",
+  "score": 0.0
+}

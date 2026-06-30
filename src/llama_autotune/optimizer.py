@@ -9,7 +9,7 @@ import optuna
 from .benchmark import run_benchmark
 from .constraints import detect_oom_in_output, is_plausible
 from .hardware import detect_hardware
-from .heuristics import generate_initial_config
+from .heuristics import generate_initial_config, to_cpu_config
 from .model_inspector import inspect_model
 from .models import (
     BenchmarkResult,
@@ -97,9 +97,18 @@ class Optimizer:
 
     def _generate_fallbacks(self) -> list[SearchConfig]:
         fallbacks = []
-        threads_opts = [self.hw.physical_cores, self.hw.logical_cores, max(4, self.hw.physical_cores // 2)]
+        threads_opts = sorted({
+            self.hw.physical_cores,
+            self.hw.logical_cores,
+            max(1, self.hw.physical_cores // 2),
+        }, reverse=True)
         for t in threads_opts:
             cfg = self._initial_config.model_copy()
+            cfg.threads = t
+            fallbacks.append(cfg)
+        cpu = to_cpu_config(self._initial_config)
+        for t in threads_opts:
+            cfg = cpu.model_copy()
             cfg.threads = t
             fallbacks.append(cfg)
         return fallbacks

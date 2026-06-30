@@ -41,12 +41,19 @@ def _configure_cpu(config: SearchConfig, hw: HardwareInfo) -> None:
 
 
 def _configure_gpu(config: SearchConfig, hw: HardwareInfo) -> None:
-    config.threads = max(hw.physical_cores - 2, 4)
+    config.threads = max(1, min(hw.logical_cores, hw.physical_cores))
     if hw.gpu_count > 1:
         config.split_mode = "layer"
 
 
+def to_cpu_config(config: SearchConfig) -> SearchConfig:
+    cfg = config.model_copy()
+    cfg.n_gpu_layers = 0
+    cfg.flash_attn = False
+    return cfg
+
+
 def apply_search_config(hw: HardwareInfo, model: ModelInfo, base: SearchConfig) -> SearchConfig:
     cfg = base.model_copy()
-    cfg.threads = hw.physical_cores
+    cfg.threads = max(1, min(hw.logical_cores, hw.physical_cores))
     return cfg
