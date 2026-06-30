@@ -28,7 +28,7 @@ llama-autotune search model.gguf --objective max_generation_tps
 ### Option 1: Install from source (recommended)
 
 ```bash
-git clone https://github.com/YOUR_USER/llama-autotune.git
+git clone https://github.com/Najafu/llama-autotune.git
 cd llama-autotune
 uv sync
 ```
@@ -36,7 +36,7 @@ uv sync
 ### Option 2: Install directly from GitHub
 
 ```bash
-pip install git+https://github.com/YOUR_USER/llama-autotune.git
+pip install git+https://github.com/Najafu/llama-autotune.git
 ```
 
 ### Setting up llama.cpp
