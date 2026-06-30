@@ -8,3 +8,4 @@ build/
 *.db
 profiles/*
 !profiles/.gitkeep
+*.json

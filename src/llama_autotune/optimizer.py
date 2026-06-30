@@ -12,6 +12,7 @@ from .hardware import detect_hardware
 from .heuristics import generate_initial_config, to_cpu_config
 from .model_inspector import inspect_model
 from .models import (
+    Backend,
     BenchmarkResult,
     HardwareInfo,
     ModelInfo,
@@ -22,6 +23,8 @@ from .search_space import ParamDef, config_from_params, get_search_space
 
 logger = logging.getLogger(__name__)
 
+_SLOW_TIMEOUT = 15.0
+
 
 class Optimizer:
     def __init__(
@@ -31,11 +34,13 @@ class Optimizer:
         n_trials_stage_b: int = 15,
         n_trials_stage_c: int = 40,
         llama_dir: str | None = None,
+        slow: bool = False,
     ):
         self.model_path = model_path
         self.objective = objective
         self.n_trials_stage_b = n_trials_stage_b
         self.n_trials_stage_c = n_trials_stage_c
+        self.slow = slow
 
         if llama_dir:
             import os
@@ -61,7 +66,11 @@ class Optimizer:
         self._stage_a_baseline()
         if self._best_config is not None:
             self._stage_b_local_search()
-        self._stage_c_bayesian()
+        else:
+            return self._initial_config
+
+        if self._best_config is not None:
+            self._stage_c_bayesian()
 
         logger.info(
             "Optimization complete",
@@ -72,7 +81,7 @@ class Optimizer:
 
     def _stage_a_baseline(self) -> None:
         logger.info("Stage A: rule-based baseline")
-        result = self._evaluate(self._initial_config)
+        result = self._evaluate(self._initial_config, detect_slow=True)
         if result.success:
             self._best_config = self._initial_config
             self._best_score = self._score(result)
@@ -83,6 +92,10 @@ class Optimizer:
                 prompt_tps=result.prompt_tps,
             )
         else:
+            was_timeout = "[TIMEOUT]" in result.raw_output
+            if was_timeout and not self.slow:
+                logger.warning("Benchmark too slow on this machine — skipping search")
+                return
             logger.warning("Baseline config failed, trying fallbacks")
             self._try_fallback_configs()
 
@@ -175,13 +188,14 @@ class Optimizer:
             self._best_score = study.best_value
             logger.info("Bayesian improved", score=self._best_score)
 
-    def _evaluate(self, config: SearchConfig) -> BenchmarkResult:
+    def _evaluate(self, config: SearchConfig, detect_slow: bool = False) -> BenchmarkResult:
         key = self._config_key(config)
         if key in self._cache:
             return self._cache[key]
 
         self._total_evals += 1
-        result = run_benchmark(self.model_path, config)
+        timeout = int(_SLOW_TIMEOUT) if detect_slow else 900
+        result = run_benchmark(self.model_path, config, timeout=timeout)
         self._cache[key] = result
 
         if detect_oom_in_output(result.raw_output):

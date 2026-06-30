@@ -18,7 +18,7 @@ from .database import get_best_benchmark, get_session, save_benchmark, save_laun
 from .hardware import detect_hardware
 from .heuristics import generate_initial_config
 from .model_inspector import inspect_model
-from .models import BenchmarkEntry, LaunchProfile, OptimizeObjective, SearchConfig
+from .models import BenchmarkEntry, BenchmarkResult, LaunchProfile, OptimizeObjective, SearchConfig
 from .optimizer import Optimizer
 from .profiles import create_profile, export_profile, import_profile
 
@@ -30,8 +30,28 @@ app = typer.Typer(
 )
 logger = logging.getLogger(__name__)
 
+EXAMPLES = """
+Examples:
 
-@app.command()
+  # Show hardware and model info
+  llama-autotune inspect model.gguf
+
+  # Run a quick benchmark
+  llama-autotune benchmark model.gguf -r 3
+
+  # Auto-optimize and save a launch profile
+  llama-autotune search model.gguf --objective max_generation_tps --profile best.json
+
+  # Start llama-server with optimal config
+  llama-autotune launch model.gguf
+
+  # Save and load profiles
+  llama-autotune export my_profile.json --model model.gguf --hardware "RTX 4090"
+  llama-autotune import my_profile.json
+"""
+
+
+@app.command(help="Inspect hardware and model metadata." + EXAMPLES)
 def inspect(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
 ):
@@ -64,7 +84,7 @@ def inspect(
     console.print(table2)
 
 
-@app.command()
+@app.command(help="Run a benchmark with optional custom parameters." + EXAMPLES)
 def benchmark(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     threads: Optional[int] = typer.Option(None, "-t", "--threads", help="CPU threads"),
@@ -122,7 +142,7 @@ def benchmark(
         raise typer.Exit(code=1)
 
 
-@app.command()
+@app.command(help="Auto-optimize config via 3-stage search." + EXAMPLES)
 def search(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     objective: str = typer.Option(
@@ -175,13 +195,20 @@ def search(
     console.print("[bold]Running optimization...[/bold]")
     best_config = opt.run()
 
-    result = run_benchmark(model, best_config, repetitions=3)
+    is_slow = opt.best_score == 0.0 and opt.total_evals <= 1
+
+    if is_slow:
+        console.print("[yellow]Benchmark takes too long on this machine.[/yellow]")
+        console.print("[yellow]Using heuristic config (no real benchmarks were run).[/yellow]")
+        result = BenchmarkResult()
+    else:
+        result = run_benchmark(model, best_config, repetitions=3)
 
     table = Table(title=f"Best Config ({opt.objective.value})", box=box.ROUNDED)
     table.add_column("Parameter", style="cyan")
     table.add_column("Value", style="green")
-    table.add_row("Prompt TPS", f"{result.prompt_tps:.2f}")
-    table.add_row("Generation TPS", f"{result.generation_tps:.2f}")
+    table.add_row("Prompt TPS", f"{result.prompt_tps:.2f}" if result.success else "N/A")
+    table.add_row("Generation TPS", f"{result.generation_tps:.2f}" if result.success else "N/A")
     table.add_row("Score", f"{opt.best_score:.2f}")
     table.add_row("Evaluations", str(opt.total_evals))
 
@@ -203,18 +230,19 @@ def search(
         path = export_profile(profile, output_profile)
         console.print(f"[green]Profile saved to {path}[/green]")
 
-    entry = BenchmarkEntry(
-        hardware_id=opt.hw.cpu_name,
-        model_id=mi.architecture,
-        config=best_config or SearchConfig(),
-        result=result,
-        objective=obj,
-    )
-    session = get_session()
-    save_benchmark(session, entry)
+    if not is_slow:
+        entry = BenchmarkEntry(
+            hardware_id=opt.hw.cpu_name,
+            model_id=mi.architecture,
+            config=best_config or SearchConfig(),
+            result=result,
+            objective=obj,
+        )
+        session = get_session()
+        save_benchmark(session, entry)
 
 
-@app.command()
+@app.command(help="Start llama-server with optimal config." + EXAMPLES)
 def launch(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     profile: Optional[str] = typer.Option(
@@ -243,7 +271,7 @@ def launch(
     os.execvp(cmd[0], cmd)
 
 
-@app.command()
+@app.command(help="Export a launch profile to JSON." + EXAMPLES)
 def export(
     profile: str = typer.Argument(..., help="Profile name or path to save"),
     model: str = typer.Option("", "--model", "-m", help="Model path"),
@@ -261,7 +289,7 @@ def export(
     console.print(f"[green]Profile exported to {path}[/green]")
 
 
-@app.command()
+@app.command(help="Import a launch profile from JSON." + EXAMPLES)
 def import_cmd(
     profile: str = typer.Argument(..., help="Path to profile JSON"),
 ):
