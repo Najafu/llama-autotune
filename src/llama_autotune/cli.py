@@ -253,7 +253,8 @@ def search(
     console.print("[bold]Running optimization...[/bold]")
     best_config = opt.run()
 
-    result = run_benchmark(model, best_config, repetitions=3,
+    result = run_benchmark(model, best_config,
+                           repetitions=opt._bench_reps,
                            n_prompt=opt._n_prompt, n_gen=opt._n_gen)
 
     table = Table(title=f"Best Config ({opt.objective.value})", box=box.ROUNDED)

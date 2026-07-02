@@ -47,6 +47,7 @@ def run_benchmark(
     timeout: int = 300,
     n_prompt: int = 512,
     n_gen: int = 128,
+    no_warmup: bool = False,
 ) -> BenchmarkResult:
     """Execute llama-bench for a given model and return the results.
 
@@ -62,6 +63,7 @@ def run_benchmark(
         timeout: Maximum time in seconds to wait for the subprocess.
         n_prompt: Number of prompt tokens (passed via ``-p``).
         n_gen: Number of generation tokens (passed via ``-n``).
+        no_warmup: If True, pass ``--no-warmup`` to skip warmup runs.
 
     Returns:
         A ``BenchmarkResult`` with ``success`` set to ``True`` on
@@ -75,6 +77,8 @@ def run_benchmark(
 
     cmd = [bench_path, "-m", model_path, "-r", str(repetitions), "-o", "json",
            "-p", str(n_prompt), "-n", str(n_gen)]
+    if no_warmup:
+        cmd.append("--no-warmup")
     if config is not None:
         cmd.extend(config.to_bench_args())
 
@@ -121,9 +125,13 @@ def run_benchmark(
 def _parse_benchmark_output(output: str) -> dict | None:
     """Parse the JSON output from llama-bench into a flat dictionary.
 
-    Handles both a single JSON object and a JSON array (uses the last
-    entry).  Falls back to line-by-line JSONL parsing if top-level
-    parsing fails.
+    Handles JSON arrays, single JSON objects, and JSONL (one object per
+    line).  Works with both the current llama-bench format (using
+    ``avg_ts``) and legacy format (``pp_avg`` / ``tg_avg``).
+
+    When ``--no-warmup`` is used, llama-bench outputs two entries: a
+    prompt-processing entry (``n_gen=0``) and a generation entry
+    (``n_gen>0``).  The function identifies each by the ``n_gen`` field.
 
     Args:
         output: The raw stdout text from llama-bench.
@@ -133,37 +141,59 @@ def _parse_benchmark_output(output: str) -> dict | None:
         ``memory_usage``, or ``None`` if no valid data could be
         extracted.
     """
+    entries: list[dict] = []
+
+    # Try top-level JSON parse first (array or single object)
     try:
         data = json.loads(output)
-        if isinstance(data, list) and len(data) > 0:
-            entry = data[-1]
+        if isinstance(data, list):
+            entries = data
         elif isinstance(data, dict):
-            entry = data
-        else:
-            return None
-
-        return {
-            "prompt_tps": float(entry.get("pp_avg", entry.get("prompt_tps", 0))),
-            "generation_tps": float(entry.get("tg_avg", entry.get("generation_tps", 0))),
-            "memory_usage": float(entry.get("mem_usage", entry.get("memory_usage", 0))),
-        }
+            entries = [data]
     except (json.JSONDecodeError, ValueError, TypeError):
-        pass
+        # Fall back to line-by-line JSONL
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                if isinstance(d, dict):
+                    entries.append(d)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
 
-    last_result = None
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-            if isinstance(data, dict):
-                last_result = {
-                    "prompt_tps": float(data.get("pp_avg", data.get("prompt_tps", 0))),
-                    "generation_tps": float(data.get("tg_avg", data.get("generation_tps", 0))),
-                    "memory_usage": float(data.get("mem_usage", data.get("memory_usage", 0))),
-                }
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
+    if not entries:
+        return None
 
-    return last_result
+    prompt_tps = 0.0
+    gen_tps = 0.0
+    memory = 0.0
+    is_split = len(entries) > 1
+
+    for entry in entries:
+        n_gen = entry.get("n_gen", 0)
+        n_prompt = entry.get("n_prompt", 0)
+        avg_ts = entry.get("avg_ts")
+
+        if avg_ts is not None:
+            ftps = float(avg_ts)
+            if n_gen and n_gen > 0:
+                gen_tps = ftps
+            elif n_prompt and n_prompt > 0 and is_split:
+                prompt_tps = ftps
+            elif not is_split:
+                gen_tps = ftps
+
+        prompt_tps = max(prompt_tps,
+                         float(entry.get("pp_avg", entry.get("prompt_tps", 0))))
+        gen_tps = max(gen_tps,
+                      float(entry.get("tg_avg", entry.get("generation_tps", 0))))
+        memory = max(memory,
+                     float(entry.get("mem_usage", entry.get("memory_usage", 0))))
+
+    return {
+        "prompt_tps": prompt_tps,
+        "generation_tps": gen_tps,
+        "memory_usage": memory,
+    }

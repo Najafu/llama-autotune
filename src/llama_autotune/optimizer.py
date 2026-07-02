@@ -92,16 +92,16 @@ class Optimizer:
     def _estimate_speed(self) -> None:
         """Run a minimal benchmark to determine hardware speed tier.
 
-        Uses a tiny prompt (64 tokens) and short generation (32 tokens)
-        with a single repetition and a 20-second timeout.  Based on the
-        measured generation throughput the method sets ``_speed_tier``,
-        ``_n_prompt``, ``_n_gen``, and ``_bench_reps`` so that
-        subsequent evaluations are scaled to the hardware.
+        Uses a small prompt (16 tokens) and short generation (8 tokens)
+        with a single repetition, no warmup, and a 30-second timeout.
+        Based on the measured generation throughput the method sets
+        ``_speed_tier``, ``_n_prompt``, ``_n_gen``, and ``_bench_reps``
+        so that subsequent evaluations are scaled to the hardware.
         """
-        cfg = SearchConfig()
+        cfg = SearchConfig(threads=self.hw.physical_cores)
         result = run_benchmark(self.model_path, cfg,
-                               repetitions=1, timeout=20,
-                               n_prompt=64, n_gen=32)
+                               repetitions=1, timeout=30,
+                               n_prompt=16, n_gen=8, no_warmup=True)
         if not result.success:
             self._speed_tier = "very_slow"
             logger.info("Speed probe failed — tier: very_slow")
@@ -143,6 +143,7 @@ class Optimizer:
         self._estimate_speed()
         if self._speed_tier == "very_slow":
             logger.warning("Hardware too slow for benchmarking — using heuristic")
+            self._n_prompt, self._n_gen, self._bench_reps = 64, 32, 1
             return self._initial_config
 
         self._stage_a_baseline()
