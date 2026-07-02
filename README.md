@@ -1,6 +1,11 @@
 # llama-autotune
 
-A cross-platform benchmarking and optimization tool for `llama.cpp` that automatically discovers the fastest stable configuration for any model + hardware combination.
+A cross-platform benchmarking and optimization tool for `llama.cpp` that automatically discovers the fastest stable configuration for any combination of:
+
+- CPU-only, NVIDIA (CUDA), AMD (ROCm/Vulkan), Intel, and Apple Silicon systems
+- Single-GPU and multi-GPU setups
+- Dense and Mixture-of-Experts (MoE) models
+- Any GGUF quantization
 
 ```bash
 llama-autotune search model.gguf --objective max_generation_tps
@@ -10,8 +15,9 @@ llama-autotune search model.gguf --objective max_generation_tps
 
 - **Hardware Detection** — CPU cores, RAM, GPU vendor/model/VRAM across Windows, Linux, macOS
 - **GGUF Inspection** — reads model architecture, parameter count, quantization, layer count, context length, MoE info directly from GGUF headers
-- **3-Stage Optimization** — rule-based baseline → local grid search → Bayesian (Optuna) tuning
-- **Constraint Engine** — VRAM estimation, OOM detection, plausibility checks
+- **Auto-Scaling Search** — runs a tiny speed probe first, then scales benchmark size and trial count to match the hardware (works on Raspberry Pi and Threadripper alike)
+- **3-Stage Optimization** — heuristic baseline → local grid search → Bayesian (Optuna) tuning
+- **Constraint Engine** — VRAM estimation, OOM detection, plausibility checks (rejects bad configs before benchmarking)
 - **Multi-GPU Support** — tensor-split ratio search for 2+ GPU systems
 - **SQLite Database** — persistent benchmark history and launch profiles
 - **Launch Profiles** — export/import reusable JSON configurations
@@ -78,7 +84,18 @@ llama-autotune benchmark model.gguf -r 3 -t 8 -b 2048
 
 ### search
 
-Run the full 3-stage optimizer to find the best configuration.
+Run the full 3-stage optimizer to find the best configuration. The optimizer
+automatically detects hardware speed with a minimal probe (`-p 64 -n 32 -r 1`)
+and scales all benchmarks accordingly:
+
+| Speed tier | Gen TPS | Trial budget | Benchmark size |
+|---|---|---|---|
+| `very_slow` | < 1 or timeout | Heuristic only | — |
+| `slow` | 1 – 4 | 10 | 64 prompt, 32 gen, 1 rep |
+| `medium` | 4 – 15 | 25 | 256 prompt, 64 gen, 2 reps |
+| `fast` | > 15 | 55 | 512 prompt, 128 gen, 3 reps |
+
+No configuration needed — works on anything from a Raspberry Pi to a Threadripper.
 
 ```bash
 llama-autotune search model.gguf --objective balanced
@@ -119,11 +136,11 @@ llama-autotune import profile.json
 | pydantic | Data validation |
 | rich | Terminal output |
 | sqlalchemy | Database ORM |
-| gguf | GGUF model parser |
 | optuna | Bayesian optimization |
 | psutil | Hardware detection |
 | structlog | Logging |
-| pyyaml | Config files |
+
+> **Note:** GGUF files are parsed with a fast custom header reader (no external library needed).
 
 ## Project Structure
 
@@ -146,7 +163,7 @@ src/llama_autotune/
 ## Architecture
 
 ```
-Hardware Probe → GGUF Inspector → Config Generator → Benchmark Engine → Optimizer → Profile Database → Launcher
+Hardware Probe → GGUF Inspector → Config Generator → Speed Probe → Benchmark Engine → Optimizer → Profile Database → Launcher
 ```
 
 ## Testing
@@ -163,10 +180,15 @@ MIT. See [LICENSE](LICENSE).
 
 PRs welcome. Please run tests (`uv run pytest`) before submitting and match the existing code style (Google-style docstrings, full type annotations).
 
-## Roadmap
+## Project Status
 
-- Milestone 1: Hardware Detection + GGUF Inspection + Benchmark ✓
-- Milestone 2: Config Generator + SQLite Storage + Result Parsing ✓
-- Milestone 3: Optimization Engine + OOM Detection + Retry Logic ✓
-- Milestone 4: Launch Profiles + Multi-GPU + CLI Commands ✓
-- Milestone 5: Community Benchmark Sharing + Cloud Database + Web Dashboard
+All milestones 1–4 are complete. The tool is ready for daily use.
+
+| Milestone | Status |
+|---|---|
+| 1. Hardware Detection + GGUF Inspection + Benchmark | ✓ |
+| 2. Config Generator + SQLite Storage + Result Parsing | ✓ |
+| 3. Optimization Engine + OOM Detection + Auto-Scaling | ✓ |
+| 4. Launch Profiles + Multi-GPU + CLI Commands | ✓ |
+
+**Future (no timeline):** Community benchmark sharing, cloud database, web dashboard.

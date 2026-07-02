@@ -25,7 +25,7 @@ from .database import get_best_benchmark, get_session, save_benchmark, save_laun
 from .hardware import detect_hardware
 from .heuristics import generate_initial_config
 from .model_inspector import inspect_model
-from .models import BenchmarkEntry, BenchmarkResult, LaunchProfile, OptimizeObjective, SearchConfig
+from .models import BenchmarkEntry, LaunchProfile, OptimizeObjective, SearchConfig
 from .optimizer import Optimizer
 from .profiles import create_profile, export_profile, import_profile
 
@@ -253,14 +253,8 @@ def search(
     console.print("[bold]Running optimization...[/bold]")
     best_config = opt.run()
 
-    is_slow = opt.best_score == 0.0 and opt.total_evals <= 1
-
-    if is_slow:
-        console.print("[yellow]Benchmark takes too long on this machine.[/yellow]")
-        console.print("[yellow]Using heuristic config (no real benchmarks were run).[/yellow]")
-        result = BenchmarkResult()
-    else:
-        result = run_benchmark(model, best_config, repetitions=3)
+    result = run_benchmark(model, best_config, repetitions=3,
+                           n_prompt=opt._n_prompt, n_gen=opt._n_gen)
 
     table = Table(title=f"Best Config ({opt.objective.value})", box=box.ROUNDED)
     table.add_column("Parameter", style="cyan")
@@ -288,7 +282,7 @@ def search(
         path = export_profile(profile, output_profile)
         console.print(f"[green]Profile saved to {path}[/green]")
 
-    if not is_slow:
+    if opt.total_evals > 0:
         entry = BenchmarkEntry(
             hardware_id=opt.hw.cpu_name,
             model_id=mi.architecture,

@@ -35,9 +35,6 @@ from .search_space import ParamDef, config_from_params, get_search_space
 
 logger = logging.getLogger(__name__)
 
-_SLOW_TIMEOUT = 15.0
-
-
 class Optimizer:
     """Three-stage parameter optimizer for llama.cpp.
 
@@ -86,6 +83,45 @@ class Optimizer:
         self._total_evals: int = 0
         self._cache: dict[str, BenchmarkResult] = {}
 
+        self._speed_tier: str = "unknown"
+        self._speed_estimate: float = 0.0
+        self._n_prompt: int = 512
+        self._n_gen: int = 128
+        self._bench_reps: int = 3
+
+    def _estimate_speed(self) -> None:
+        """Run a minimal benchmark to determine hardware speed tier.
+
+        Uses a tiny prompt (64 tokens) and short generation (32 tokens)
+        with a single repetition and a 20-second timeout.  Based on the
+        measured generation throughput the method sets ``_speed_tier``,
+        ``_n_prompt``, ``_n_gen``, and ``_bench_reps`` so that
+        subsequent evaluations are scaled to the hardware.
+        """
+        cfg = SearchConfig()
+        result = run_benchmark(self.model_path, cfg,
+                               repetitions=1, timeout=20,
+                               n_prompt=64, n_gen=32)
+        if not result.success:
+            self._speed_tier = "very_slow"
+            logger.info("Speed probe failed — tier: very_slow")
+            return
+
+        tps = result.generation_tps
+        if tps < 1:
+            self._speed_tier = "very_slow"
+        elif tps < 4:
+            self._speed_tier = "slow"
+            self._n_prompt, self._n_gen, self._bench_reps = 64, 32, 1
+        elif tps < 15:
+            self._speed_tier = "medium"
+            self._n_prompt, self._n_gen, self._bench_reps = 256, 64, 2
+        else:
+            self._speed_tier = "fast"
+        self._speed_estimate = tps
+        logger.info("Speed tier",
+                    tier=self._speed_tier, gen_tps=round(tps, 2))
+
     def run(self) -> SearchConfig:
         """Run all three optimisation stages and return the best config.
 
@@ -104,11 +140,14 @@ class Optimizer:
             hw=self.hw.cpu_name,
         )
 
+        self._estimate_speed()
+        if self._speed_tier == "very_slow":
+            logger.warning("Hardware too slow for benchmarking — using heuristic")
+            return self._initial_config
+
         self._stage_a_baseline()
         if self._best_config is not None:
             self._stage_b_local_search()
-        else:
-            return self._initial_config
 
         if self._best_config is not None:
             self._stage_c_bayesian()
@@ -124,11 +163,10 @@ class Optimizer:
         """Evaluate the rule-based initial config.
 
         If the config succeeds its score is recorded.  On failure the method
-        either bails out (when the benchmark is too slow and ``slow`` is
-        False) or falls through to the fallback configs.
+        falls through to the fallback configs.
         """
         logger.info("Stage A: rule-based baseline")
-        result = self._evaluate(self._initial_config, detect_slow=True)
+        result = self._evaluate(self._initial_config)
         if result.success:
             self._best_config = self._initial_config
             self._best_score = self._score(result)
@@ -139,10 +177,6 @@ class Optimizer:
                 prompt_tps=result.prompt_tps,
             )
         else:
-            was_timeout = "[TIMEOUT]" in result.raw_output
-            if was_timeout and not self.slow:
-                logger.warning("Benchmark too slow on this machine — skipping search")
-                return
             logger.warning("Baseline config failed, trying fallbacks")
             self._try_fallback_configs()
 
@@ -262,24 +296,26 @@ class Optimizer:
             self._best_score = study.best_value
             logger.info("Bayesian improved", score=self._best_score)
 
-    def _evaluate(self, config: SearchConfig, detect_slow: bool = False) -> BenchmarkResult:
+    def _evaluate(self, config: SearchConfig) -> BenchmarkResult:
         """Run a benchmark for the given config, caching the result.
+
+        Uses the speed-tiered prompt/gen token counts and repetitions
+        set by :meth:`_estimate_speed`.
 
         Args:
             config: The configuration to evaluate.
-            detect_slow: When True a short timeout (15 s) is used to detect
-                whether the config is too slow for the host.
 
         Returns:
             A BenchmarkResult with timing and memory information.
         """
-        timeout = int(_SLOW_TIMEOUT) if detect_slow else 900
-        key = f"{self._config_key(config)}|timeout={timeout}"
+        key = self._config_key(config)
         if key in self._cache:
             return self._cache[key]
 
         self._total_evals += 1
-        result = run_benchmark(self.model_path, config, timeout=timeout)
+        result = run_benchmark(self.model_path, config, timeout=900,
+                               n_prompt=self._n_prompt, n_gen=self._n_gen,
+                               repetitions=self._bench_reps)
         self._cache[key] = result
 
         if detect_oom_in_output(result.raw_output):

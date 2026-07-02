@@ -45,6 +45,8 @@ def run_benchmark(
     config: SearchConfig | None = None,
     repetitions: int = 3,
     timeout: int = 300,
+    n_prompt: int = 512,
+    n_gen: int = 128,
 ) -> BenchmarkResult:
     """Execute llama-bench for a given model and return the results.
 
@@ -58,6 +60,8 @@ def run_benchmark(
             appended to the command line.
         repetitions: Number of benchmark repetitions (passed via ``-r``).
         timeout: Maximum time in seconds to wait for the subprocess.
+        n_prompt: Number of prompt tokens (passed via ``-p``).
+        n_gen: Number of generation tokens (passed via ``-n``).
 
     Returns:
         A ``BenchmarkResult`` with ``success`` set to ``True`` on
@@ -69,7 +73,8 @@ def run_benchmark(
     bench_path = find_llama_bench()
     model_path = str(model_path)
 
-    cmd = [bench_path, "-m", model_path, "-r", str(repetitions), "-o", "json"]
+    cmd = [bench_path, "-m", model_path, "-r", str(repetitions), "-o", "json",
+           "-p", str(n_prompt), "-n", str(n_gen)]
     if config is not None:
         cmd.extend(config.to_bench_args())
 
