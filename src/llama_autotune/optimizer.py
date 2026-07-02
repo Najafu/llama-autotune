@@ -273,12 +273,12 @@ class Optimizer:
         Returns:
             A BenchmarkResult with timing and memory information.
         """
-        key = self._config_key(config)
+        timeout = int(_SLOW_TIMEOUT) if detect_slow else 900
+        key = f"{self._config_key(config)}|timeout={timeout}"
         if key in self._cache:
             return self._cache[key]
 
         self._total_evals += 1
-        timeout = int(_SLOW_TIMEOUT) if detect_slow else 900
         result = run_benchmark(self.model_path, config, timeout=timeout)
         self._cache[key] = result
 
@@ -302,7 +302,7 @@ class Optimizer:
         elif self.objective == OptimizeObjective.MAX_PROMPT_TPS:
             return result.prompt_tps
         elif self.objective == OptimizeObjective.MIN_LATENCY:
-            return result.startup_time
+            return -result.startup_time
         elif self.objective == OptimizeObjective.MAX_EFFICIENCY:
             return result.generation_tps / max(result.memory_usage, 1)
         elif self.objective == OptimizeObjective.MAX_CONTEXT:

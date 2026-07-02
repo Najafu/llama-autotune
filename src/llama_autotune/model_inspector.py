@@ -42,16 +42,12 @@ _KNOWN_FILE_TYPES: dict[int, str] = {
     19: "IQ2_XS",
     20: "IQ2_S",
     21: "IQ2_M",
-    22: "IQ2_S",
-    23: "IQ3_XXS",
-    24: "IQ3_XS",
-    25: "IQ3_S",
-    26: "IQ3_M",
-    27: "IQ4_XS",
-    28: "IQ4_NL",
-    29: "IQ4_XS",
-    30: "IQ4_XS",
-    31: "IQ4_NL",
+    22: "IQ3_XXS",
+    23: "IQ3_XS",
+    24: "IQ3_S",
+    25: "IQ3_M",
+    26: "IQ4_XS",
+    27: "IQ4_NL",
 }
 
 
@@ -81,6 +77,14 @@ def inspect_model(path: str | Path) -> ModelInfo:
     info.training_context = _get_int(kv, f"{info.architecture}.context_length", default=0)
 
     expert_count = _get_int(kv, f"{info.architecture}.expert_count", default=0)
+    if expert_count == 0:
+        for key, val in kv.items():
+            if "expert_count" in key:
+                try:
+                    expert_count = int(val)
+                except (ValueError, TypeError):
+                    pass
+                break
     info.is_moe = expert_count > 1
 
     if info.is_moe:

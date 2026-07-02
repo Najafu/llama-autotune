@@ -18,12 +18,12 @@ from .models import LaunchProfile
 def get_profiles_dir() -> str:
     """Return the absolute path to the profiles storage directory.
 
-    The directory is located at the project root under ``profiles/``.
+    The directory is located at ``~/.llama-autotune/profiles/``.
 
     Returns:
         Absolute directory path as a string.
     """
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "profiles")
+    return os.path.join(Path.home(), ".llama-autotune", "profiles")
 
 
 def export_profile(profile: LaunchProfile, path: str | None = None) -> str:
