@@ -119,8 +119,7 @@ class Optimizer:
         else:
             self._speed_tier = "fast"
         self._speed_estimate = tps
-        logger.info("Speed tier",
-                    tier=self._speed_tier, gen_tps=round(tps, 2))
+        logger.info(f"Speed tier: {self._speed_tier} (gen_tps={round(tps, 2)})")
 
     def run(self) -> SearchConfig:
         """Run all three optimisation stages and return the best config.
@@ -133,12 +132,7 @@ class Optimizer:
             The best SearchConfig found, or the initial heuristic config if
             no successful evaluation was produced.
         """
-        logger.info(
-            "Starting optimization",
-            model=self.model_path,
-            objective=self.objective.value,
-            hw=self.hw.cpu_name,
-        )
+        logger.info(f"Starting optimization — model={self.model_path} objective={self.objective.value} hw={self.hw.cpu_name}")
 
         self._estimate_speed()
         if self._speed_tier == "very_slow":
@@ -153,11 +147,7 @@ class Optimizer:
         if self._best_config is not None:
             self._stage_c_bayesian()
 
-        logger.info(
-            "Optimization complete",
-            best_score=self._best_score,
-            total_evals=self._total_evals,
-        )
+        logger.info(f"Optimization complete — best_score={self._best_score} total_evals={self._total_evals}")
         return self._best_config or self._initial_config
 
     def _stage_a_baseline(self) -> None:
@@ -171,12 +161,7 @@ class Optimizer:
         if result.success:
             self._best_config = self._initial_config
             self._best_score = self._score(result)
-            logger.info(
-                "Baseline score",
-                score=self._best_score,
-                gen_tps=result.generation_tps,
-                prompt_tps=result.prompt_tps,
-            )
+            logger.info(f"Baseline score={self._best_score} gen_tps={result.generation_tps} prompt_tps={result.prompt_tps}")
         else:
             logger.warning("Baseline config failed, trying fallbacks")
             self._try_fallback_configs()
@@ -192,7 +177,7 @@ class Optimizer:
             if result.success:
                 self._best_config = cfg
                 self._best_score = self._score(result)
-                logger.info("Fallback worked", score=self._best_score)
+                logger.info(f"Fallback worked (score={self._best_score})")
                 return
 
     def _generate_fallbacks(self) -> list[SearchConfig]:
@@ -255,12 +240,7 @@ class Optimizer:
                     if score > self._best_score:
                         self._best_config = cfg
                         self._best_score = score
-                        logger.info(
-                            "New best (Stage B)",
-                            param=param_name,
-                            val=val,
-                            score=score,
-                        )
+                        logger.info(f"New best (Stage B) — {param_name}={val} score={score}")
                 evals += 1
 
     def _stage_c_bayesian(self) -> None:
@@ -295,7 +275,7 @@ class Optimizer:
             best_params = study.best_params
             self._best_config = config_from_params(best_params, self._best_config)
             self._best_score = study.best_value
-            logger.info("Bayesian improved", score=self._best_score)
+            logger.info(f"Bayesian improved (score={self._best_score})")
 
     def _evaluate(self, config: SearchConfig) -> BenchmarkResult:
         """Run a benchmark for the given config, caching the result.
@@ -321,7 +301,7 @@ class Optimizer:
 
         if detect_oom_in_output(result.raw_output):
             result.success = False
-            logger.warning("OOM detected", config=key)
+            logger.warning(f"OOM detected — {key}")
 
         return result
 

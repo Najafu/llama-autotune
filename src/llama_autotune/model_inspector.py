@@ -32,10 +32,17 @@ _KNOWN_FILE_TYPES: dict[int, str] = {
     1: "F16",
     2: "Q4_0",
     3: "Q4_1",
+    4: "Q4_1_SOME_F16",
     6: "Q5_0",
     7: "Q5_1",
     8: "Q8_0",
+    9: "Q8_K",
     10: "Q8_1",
+    11: "Q2_K",
+    12: "Q3_K",
+    13: "Q4_K",
+    14: "Q5_K",
+    15: "Q6_K",
     16: "IQ1_S",
     17: "IQ1_M",
     18: "IQ2_XXS",
@@ -49,6 +56,14 @@ _KNOWN_FILE_TYPES: dict[int, str] = {
     26: "IQ4_XS",
     27: "IQ4_NL",
 }
+
+_QUANT_PATTERNS = [
+    "IQ4_XS", "IQ4_NL", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M",
+    "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ1_S", "IQ1_M",
+    "Q4_K_M", "Q4_K_S", "Q4_K_P", "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_K",
+    "Q2_K", "Q3_K", "Q4_K", "Q5_K",
+    "Q8_0", "Q8_1", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "BF16", "F16", "F32",
+]
 
 
 def inspect_model(path: str | Path) -> ModelInfo:
@@ -70,7 +85,7 @@ def inspect_model(path: str | Path) -> ModelInfo:
     kv = _read_gguf_header(path)
 
     info.architecture = _get_str(kv, "general.architecture")
-    info.quantization = _resolve_file_type(kv)
+    info.quantization = _resolve_file_type(kv, path)
     info.parameters = _resolve_param_count(kv)
     info.n_layers = _resolve_block_count(kv, info.architecture)
     info.n_heads = _get_int(kv, f"{info.architecture}.attention.head_count", default=0)
@@ -97,29 +112,35 @@ def inspect_model(path: str | Path) -> ModelInfo:
     return info
 
 
-def _resolve_file_type(kv: dict) -> str:
+def _resolve_file_type(kv: dict, model_path: str = "") -> str:
     """Resolve the quantization / file-type string from GGUF metadata.
 
-    Tries the integer ``general.file_type`` key first, then falls back
-    to scanning ``general.name`` for known type substrings
-    (e.g. ``Q4_0``, ``F16``).  Returns ``"unknown"`` if nothing
-    matches.
+    Prioritises (in order):
+    1. ``general.name`` metadata field
+    2. The model filename
+    3. The integer ``general.file_type`` key mapped through
+       ``_KNOWN_FILE_TYPES``
+    4. The raw ``general.file_type`` value as a string
 
     Args:
         kv: The GGUF header key-value dictionary.
+        model_path: The model file path, used for filename fallback.
 
     Returns:
         A string such as ``"Q4_0"``, ``"F16"``, or ``"unknown"``.
     """
+    for source in (os.path.splitext(os.path.basename(str(model_path)))[0]
+                   if model_path else "",
+                   _get_str(kv, "general.name")):
+        if not source:
+            continue
+        upper = source.upper()
+        for pat in _QUANT_PATTERNS:
+            if pat in upper:
+                return pat
     raw = _get_int(kv, "general.file_type", default=-1)
     if raw in _KNOWN_FILE_TYPES:
         return _KNOWN_FILE_TYPES[raw]
-    name = _get_str(kv, "general.name")
-    if name:
-        parts = name.split()
-        for p in parts:
-            if any(x in p for x in ["Q4", "Q5", "Q8", "IQ", "F16", "F32", "BF16"]):
-                return p
     return str(raw) if raw >= 0 else "unknown"
 
 

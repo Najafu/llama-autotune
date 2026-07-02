@@ -37,6 +37,12 @@ app = typer.Typer(
 )
 logger = logging.getLogger(__name__)
 
+
+def _require_model_file(path: str) -> None:
+    if not os.path.isfile(path):
+        console.print(f"[red]Error: model file not found: {path}[/red]")
+        raise typer.Exit(code=1)
+
 EXAMPLES = """
 Examples:
 
@@ -74,8 +80,14 @@ def inspect(
     Returns:
         None.
     """
+    _require_model_file(model)
+
     hw = detect_hardware()
-    model_info = inspect_model(model)
+    try:
+        model_info = inspect_model(model)
+    except (FileNotFoundError, PermissionError) as e:
+        console.print(f"[red]Error reading model: {e}[/red]")
+        raise typer.Exit(code=1)
 
     table = Table(title="Hardware", box=box.ROUNDED)
     table.add_column("Property", style="cyan")
@@ -136,6 +148,8 @@ def benchmark(
     Returns:
         None.
     """
+    _require_model_file(model)
+
     hw = detect_hardware()
     model_info = inspect_model(model)
 
@@ -215,6 +229,8 @@ def search(
     Returns:
         None.
     """
+    _require_model_file(model)
+
     try:
         obj = OptimizeObjective(objective)
     except ValueError:
@@ -320,7 +336,12 @@ def launch(
     Returns:
         None (the current process is replaced by llama-server).
     """
+    _require_model_file(model)
+
     if profile:
+        if not os.path.isfile(profile):
+            console.print(f"[red]Error: profile file not found: {profile}[/red]")
+            raise typer.Exit(code=1)
         prof = import_profile(profile)
         args = prof.args
     else:
@@ -387,6 +408,9 @@ def import_cmd(
     Returns:
         None.
     """
+    if not os.path.isfile(profile):
+        console.print(f"[red]Error: profile file not found: {profile}[/red]")
+        raise typer.Exit(code=1)
     prof = import_profile(profile)
     table = Table(title=f"Profile: {prof.name}", box=box.ROUNDED)
     table.add_column("Field", style="cyan")
