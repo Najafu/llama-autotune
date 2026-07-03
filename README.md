@@ -14,7 +14,7 @@ llama-autotune search model.gguf --objective max_generation_tps
 ## Features
 
 - **Hardware Detection** — CPU cores, RAM, GPU vendor/model/VRAM across Windows, Linux, macOS
-- **GGUF Inspection** — reads model architecture, parameter count, quantization, layer count, context length, MoE info directly from GGUF headers
+- **GGUF Inspection** — reads model architecture, parameter count, quantization, layer count, context length, MoE status (total vs active parameters, expert count) directly from GGUF headers
 - **Auto-Scaling Search** — runs a tiny speed probe first, then scales benchmark size and trial count to match the hardware (works on Raspberry Pi and Threadripper alike)
 - **3-Stage Optimization** — heuristic baseline → local grid search → Bayesian (Optuna) tuning
 - **Constraint Engine** — VRAM estimation, OOM detection, plausibility checks (rejects bad configs before benchmarking)
@@ -68,10 +68,15 @@ llama-autotune inspect path/to/model.gguf
 
 ### inspect
 
-Show hardware and model metadata.
+Show hardware and model metadata. MoE models display both total and active parameter counts.
 
 ```bash
 llama-autotune inspect model.gguf
+
+# MoE models show Active Params:
+# Parameters     7,000,000,000
+# MoE            Yes
+# Active Params  1,000,000,000
 ```
 
 ### benchmark
@@ -103,6 +108,8 @@ llama-autotune search model.gguf --objective max_generation_tps --profile best.j
 ```
 
 Objectives: `max_generation_tps`, `max_prompt_tps`, `min_latency`, `max_context`, `max_efficiency`, `balanced`
+
+MoE models (e.g. OLMoE, Qwen-MoE, DeepSeek, Mixtral) are fully supported — the inspector automatically detects `expert_count` and `expert_used_count` from GGUF headers and reports active vs total parameters.
 
 ### launch
 
@@ -172,6 +179,8 @@ Hardware Probe → GGUF Inspector → Config Generator → Speed Probe → Bench
 uv run pytest -v
 ```
 
+74 tests cover parser variants, MoE detection, constraint logic, hardware detection, search space, and database operations.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
@@ -182,7 +191,7 @@ PRs welcome. Please run tests (`uv run pytest`) before submitting and match the 
 
 ## Project Status
 
-All milestones 1–4 are complete. The tool is ready for daily use.
+All milestones 1–4 are complete. MoE detection verified with real models (OLMoE-1B-7B). The tool is ready for daily use.
 
 | Milestone | Status |
 |---|---|

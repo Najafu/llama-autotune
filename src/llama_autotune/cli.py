@@ -111,6 +111,8 @@ def inspect(
     table2.add_row("Heads", str(model_info.n_heads))
     table2.add_row("Context Length", str(model_info.training_context))
     table2.add_row("MoE", "Yes" if model_info.is_moe else "No")
+    if model_info.is_moe:
+        table2.add_row("Active Params", f"{model_info.active_parameters:,}")
     table2.add_row("File Size", f"{model_info.file_size_gb} GB")
     console.print(table2)
 

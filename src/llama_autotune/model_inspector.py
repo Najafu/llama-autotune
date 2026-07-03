@@ -104,8 +104,7 @@ def inspect_model(path: str | Path) -> ModelInfo:
 
     if info.is_moe:
         active = _get_int(kv, f"{info.architecture}.expert_used_count", default=0)
-        if active > 0:
-            info.active_parameters = info.parameters * active // expert_count
+        info.active_parameters = _resolve_active_param_count(kv, info.parameters, expert_count, active)
     else:
         info.active_parameters = info.parameters
 
@@ -148,8 +147,11 @@ def _resolve_param_count(kv: dict) -> int:
     """Resolve the parameter count from GGUF metadata.
 
     Reads ``general.parameter_count`` first.  If it is zero, attempts
-    to parse a human-friendly label such as ``"7B"`` or ``"70M"`` from
-    ``general.size_label``.
+    to parse a human-friendly label such as ``"7B"``, ``"70M"``, or
+    ``"1B-7B"`` (active-total) from ``general.size_label``.
+
+    For hyphenated labels like ``"1B-7B"`` the **total** (second)
+    value is returned.
 
     Args:
         kv: The GGUF header key-value dictionary.
@@ -163,14 +165,46 @@ def _resolve_param_count(kv: dict) -> int:
     label = _get_str(kv, "general.size_label")
     if label:
         multipliers = {"M": 1_000_000, "B": 1_000_000_000, "T": 1_000_000_000_000}
+        # Split on '-' to handle "1B-7B" format — try the last (total) part first
+        parts = [p.strip() for p in label.split("-")]
+        for part in reversed(parts):
+            for suffix, mult in multipliers.items():
+                if part.endswith(suffix):
+                    try:
+                        num = float(part[: -len(suffix)].strip())
+                        return int(num * mult)
+                    except ValueError:
+                        pass
+    return 0
+
+
+def _resolve_active_param_count(kv: dict, total_params: int, expert_count: int, expert_used: int) -> int:
+    """Resolve the active parameter count for an MoE model.
+
+    Prefers ``general.size_label`` (e.g. ``"1B-7B"`` → 1B active),
+    falling back to a proportional estimate from expert counts.
+
+    Args:
+        kv: The GGUF header key-value dictionary.
+        total_params: The total parameter count.
+        expert_count: Total number of experts.
+        expert_used: Number of active experts per token.
+
+    Returns:
+        The estimated number of active parameters.
+    """
+    label = _get_str(kv, "general.size_label")
+    if label and "-" in label:
+        first = label.split("-", 1)[0].strip()
+        multipliers = {"M": 1_000_000, "B": 1_000_000_000, "T": 1_000_000_000_000}
         for suffix, mult in multipliers.items():
-            if suffix in label:
+            if first.endswith(suffix):
                 try:
-                    num_str = label.replace(suffix, "").strip()
-                    num = float(num_str)
-                    return int(num * mult)
+                    return int(float(first[: -len(suffix)].strip()) * mult)
                 except ValueError:
                     pass
+    if total_params > 0 and expert_count > 0:
+        return total_params * expert_used // expert_count
     return 0
 
 
