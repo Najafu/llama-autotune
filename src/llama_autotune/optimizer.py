@@ -160,7 +160,7 @@ class Optimizer:
         result = self._evaluate(self._initial_config)
         if result.success:
             self._best_config = self._initial_config
-            self._best_score = self._score(result)
+            self._best_score = self._score(result, self._initial_config)
             logger.info(f"Baseline score={self._best_score} gen_tps={result.generation_tps} prompt_tps={result.prompt_tps}")
         else:
             logger.warning("Baseline config failed, trying fallbacks")
@@ -176,7 +176,7 @@ class Optimizer:
             result = self._evaluate(cfg)
             if result.success:
                 self._best_config = cfg
-                self._best_score = self._score(result)
+                self._best_score = self._score(result, cfg)
                 logger.info(f"Fallback worked (score={self._best_score})")
                 return
 
@@ -236,7 +236,7 @@ class Optimizer:
                     continue
                 result = self._evaluate(cfg)
                 if result.success:
-                    score = self._score(result)
+                    score = self._score(result, cfg)
                     if score > self._best_score:
                         self._best_config = cfg
                         self._best_score = score
@@ -258,12 +258,15 @@ class Optimizer:
             for pname, pdef in space.items():
                 params[pname] = self._sample_param(trial, pname, pdef)
             cfg = config_from_params(params, self._best_config)
+            # Pruning (rather than a sentinel score) keeps failed configs out
+            # of best_value — a fixed sentinel would outrank legitimate
+            # negative scores such as min_latency's -startup_time.
             if not is_plausible(cfg, self.model, self.hw):
-                return -1.0
+                raise optuna.TrialPruned()
             result = self._evaluate(cfg)
             if not result.success:
-                return -1.0
-            return self._score(result)
+                raise optuna.TrialPruned()
+            return self._score(result, cfg)
 
         study = optuna.create_study(
             direction="maximize",
@@ -271,10 +274,15 @@ class Optimizer:
         )
         study.optimize(objective_fn, n_trials=self.n_trials_stage_c, show_progress_bar=False)
 
-        if study.best_value > self._best_score:
-            best_params = study.best_params
-            self._best_config = config_from_params(best_params, self._best_config)
-            self._best_score = study.best_value
+        try:
+            best_value = study.best_value
+        except ValueError:
+            logger.info("Bayesian stage produced no successful trials")
+            return
+
+        if best_value > self._best_score:
+            self._best_config = config_from_params(study.best_params, self._best_config)
+            self._best_score = best_value
             logger.info(f"Bayesian improved (score={self._best_score})")
 
     def _evaluate(self, config: SearchConfig) -> BenchmarkResult:
@@ -305,11 +313,16 @@ class Optimizer:
 
         return result
 
-    def _score(self, result: BenchmarkResult) -> float:
+    def _score(self, result: BenchmarkResult, config: SearchConfig) -> float:
         """Compute a scalar score from a benchmark result based on the objective.
+
+        For ``MAX_CONTEXT`` the score is dominated by the configured context
+        size (feasibility is enforced by the constraint engine and benchmark
+        success), with generation throughput as a tiebreaker.
 
         Args:
             result: The benchmark result to score.
+            config: The configuration that produced the result.
 
         Returns:
             A numerical score (higher is better).
@@ -323,7 +336,7 @@ class Optimizer:
         elif self.objective == OptimizeObjective.MAX_EFFICIENCY:
             return result.generation_tps / max(result.memory_usage, 1)
         elif self.objective == OptimizeObjective.MAX_CONTEXT:
-            return result.generation_tps
+            return float(config.ctx_size or 0) + result.generation_tps / 1000.0
         else:
             return result.generation_tps
 

@@ -1,9 +1,23 @@
 [project]
 name = "llama-autotune"
-version = "0.2.0"
+version = "0.3.0"
 description = "Benchmarking and optimization tool for llama.cpp"
+readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.12"
+keywords = ["llama.cpp", "llm", "benchmark", "optimization", "gguf", "inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Benchmark",
+]
 dependencies = [
     "typer>=0.15",
     "pydantic>=2.0",
@@ -13,6 +27,12 @@ dependencies = [
     "psutil>=6.0",
     "structlog>=24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Najafu/llama-autotune"
+Repository = "https://github.com/Najafu/llama-autotune"
+Issues = "https://github.com/Najafu/llama-autotune/issues"
+Changelog = "https://github.com/Najafu/llama-autotune/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

@@ -10,6 +10,14 @@ Exposes high-level building blocks:
 - ``save_benchmark`` / ``save_launch_profile`` / ``get_best_benchmark`` — database helpers
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("llama-autotune")
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
+
 from .models import (
     Backend,
     BenchmarkEntry,

@@ -1,15 +1,40 @@
 import os
 import sys
 
-from llama_autotune.benchmark import find_llama_bench, run_benchmark
+from llama_autotune.benchmark import (
+    binary_name,
+    find_llama_bench,
+    find_llama_binary,
+    run_benchmark,
+)
 from llama_autotune.models import SearchConfig
+
+
+def test_binary_name_is_platform_aware():
+    expected = "llama-bench.exe" if os.name == "nt" else "llama-bench"
+    assert binary_name("llama-bench") == expected
 
 
 def test_find_llama_bench():
     path = find_llama_bench()
     assert path != ""
-    assert os.path.isfile(path)
-    assert path.endswith(".exe") or path.endswith(".py")
+    if not os.path.isfile(path):
+        import pytest
+        pytest.skip("llama-bench not installed on this machine")
+    assert os.path.basename(path) == binary_name("llama-bench")
+
+
+def test_find_llama_binary_prefers_env_dir(tmp_path, monkeypatch):
+    exe = tmp_path / binary_name("llama-bench")
+    exe.write_bytes(b"")
+    monkeypatch.setenv("LLAMA_CPP_DIR", str(tmp_path))
+    assert find_llama_binary("llama-bench") == str(exe)
+
+
+def test_find_llama_binary_missing_returns_bare_name(monkeypatch):
+    monkeypatch.delenv("LLAMA_CPP_DIR", raising=False)
+    result = find_llama_binary("llama-definitely-not-a-tool")
+    assert result == binary_name("llama-definitely-not-a-tool")
 
 
 def test_run_benchmark_list_devices():

@@ -119,9 +119,15 @@ def test_file_type_unknown():
 # ── inspect_model ────────────────────────────────────────────────────
 
 
+import os
+
+import pytest
+
 OLMOE_PATH = r"C:\llamacpp\models\olmoe\OLMoE-1B-7B-0125-Instruct.Q2_K.gguf"
+DENSE_PATH = r"C:\sandbox\llama\models\qwen\Qwen2.5-3B-Instruct-Q4_K_M.gguf"
 
 
+@pytest.mark.skipif(not os.path.exists(OLMOE_PATH), reason="OLMoE model not present on this machine")
 def test_inspect_olmoe():
     """Real OLMoE model must show correct MoE metadata."""
     info = inspect_model(OLMOE_PATH)
@@ -135,17 +141,17 @@ def test_inspect_olmoe():
     assert info.training_context == 4096
 
 
+@pytest.mark.skipif(not os.path.exists(DENSE_PATH), reason="Qwen dense model not present on this machine")
 def test_inspect_dense_model():
-    """Existing dense Qwen model must keep showing MoE=False."""
-    dense = r"C:\llamacpp\models\qwen\Qwen2.5-0.5B-OBLITERATED.IQ4_XS.gguf"
-    info = inspect_model(dense)
+    """Real dense Qwen model must keep showing MoE=False."""
+    info = inspect_model(DENSE_PATH)
+    assert info.architecture == "qwen2"
     assert info.is_moe is False
     assert info.active_parameters == info.parameters
-    assert info.parameters == 500_000_000
-    assert "IQ4" in info.quantization
+    assert info.parameters == 3_000_000_000
+    assert info.quantization == "Q4_K_M"
 
 
 def test_inspect_nonexistent_file():
-    import pytest
     with pytest.raises(FileNotFoundError):
         inspect_model(r"C:\nonexistent\model.gguf")

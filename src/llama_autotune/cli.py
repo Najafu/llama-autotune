@@ -20,7 +20,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
-from .benchmark import find_llama_bench, run_benchmark
+from .benchmark import find_llama_bench, find_llama_binary, run_benchmark
 from .database import get_best_benchmark, get_session, save_benchmark, save_launch_profile
 from .hardware import detect_hardware
 from .heuristics import generate_initial_config
@@ -29,10 +29,22 @@ from .models import BenchmarkEntry, LaunchProfile, OptimizeObjective, SearchConf
 from .optimizer import Optimizer
 from .profiles import create_profile, export_profile, import_profile
 
+EXAMPLES = (
+    "[bold]Examples:[/bold]\n\n"
+    "  llama-autotune inspect model.gguf\n\n"
+    "  llama-autotune benchmark model.gguf -r 3\n\n"
+    "  llama-autotune search model.gguf --objective max_generation_tps --profile best.json\n\n"
+    "  llama-autotune launch model.gguf\n\n"
+    '  llama-autotune export my_profile.json --model model.gguf --hardware "RTX 4090"\n\n'
+    "  llama-autotune import my_profile.json"
+)
+
 console = Console()
 app = typer.Typer(
     name="llama-autotune",
     help="Benchmarking and optimization tool for llama.cpp",
+    epilog=EXAMPLES,
+    rich_markup_mode="rich",
     no_args_is_help=True,
 )
 logger = logging.getLogger(__name__)
@@ -43,28 +55,8 @@ def _require_model_file(path: str) -> None:
         console.print(f"[red]Error: model file not found: {path}[/red]")
         raise typer.Exit(code=1)
 
-EXAMPLES = """
-Examples:
 
-  # Show hardware and model info
-  llama-autotune inspect model.gguf
-
-  # Run a quick benchmark
-  llama-autotune benchmark model.gguf -r 3
-
-  # Auto-optimize and save a launch profile
-  llama-autotune search model.gguf --objective max_generation_tps --profile best.json
-
-  # Start llama-server with optimal config
-  llama-autotune launch model.gguf
-
-  # Save and load profiles
-  llama-autotune export my_profile.json --model model.gguf --hardware "RTX 4090"
-  llama-autotune import my_profile.json
-"""
-
-
-@app.command(help="Inspect hardware and model metadata." + EXAMPLES)
+@app.command(help="Inspect hardware and model metadata.")
 def inspect(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
 ):
@@ -117,7 +109,7 @@ def inspect(
     console.print(table2)
 
 
-@app.command(help="Run a benchmark with optional custom parameters." + EXAMPLES)
+@app.command(help="Run a benchmark with optional custom parameters.")
 def benchmark(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     threads: Optional[int] = typer.Option(None, "-t", "--threads", help="CPU threads"),
@@ -198,7 +190,7 @@ def benchmark(
         raise typer.Exit(code=1)
 
 
-@app.command(help="Auto-optimize config via 3-stage search." + EXAMPLES)
+@app.command(help="Auto-optimize config via 3-stage search.")
 def search(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     objective: str = typer.Option(
@@ -313,7 +305,7 @@ def search(
         save_benchmark(session, entry)
 
 
-@app.command(help="Start llama-server with optimal config." + EXAMPLES)
+@app.command(help="Start llama-server with optimal config.")
 def launch(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     profile: Optional[str] = typer.Option(
@@ -326,8 +318,9 @@ def launch(
 
     If a profile path is provided its arguments are used; otherwise a
     heuristic configuration is generated from hardware detection and model
-    inspection. The server is launched via os.execvp, replacing the current
-    process.
+    inspection. On POSIX the current process is replaced via os.execvp; on
+    Windows the server runs as a child process (execvp does not quote
+    arguments correctly there).
 
     Args:
         model: Path to GGUF model file.
@@ -336,7 +329,7 @@ def launch(
         port: Server port number.
 
     Returns:
-        None (the current process is replaced by llama-server).
+        None.
     """
     _require_model_file(model)
 
@@ -352,18 +345,27 @@ def launch(
         config = generate_initial_config(hw, model_info)
         args = config.to_llama_args()
 
-    llama_dir = os.environ.get("LLAMA_CPP_DIR", "")
-    server_exe = os.path.join(llama_dir, "llama-server.exe") if llama_dir else "llama-server.exe"
+    server_exe = find_llama_binary("llama-server")
 
     cmd = [server_exe, "-m", model, "--host", host, "--port", str(port), *args]
     cmd_str = " ".join(cmd)
     console.print(f"[bold]Starting llama-server:[/bold]")
     console.print(f"  {cmd_str}")
 
-    os.execvp(cmd[0], cmd)
+    if os.name == "nt":
+        import subprocess
+
+        try:
+            proc = subprocess.run(cmd)
+        except FileNotFoundError:
+            console.print(f"[red]Error: llama-server not found at: {server_exe}[/red]")
+            raise typer.Exit(code=1)
+        raise typer.Exit(code=proc.returncode)
+    else:
+        os.execvp(cmd[0], cmd)
 
 
-@app.command(help="Export a launch profile to JSON." + EXAMPLES)
+@app.command(help="Export a launch profile to JSON.")
 def export(
     profile: str = typer.Argument(..., help="Profile name or path to save"),
     model: str = typer.Option("", "--model", "-m", help="Model path"),
@@ -395,7 +397,7 @@ def export(
     console.print(f"[green]Profile exported to {path}[/green]")
 
 
-@app.command(help="Import a launch profile from JSON." + EXAMPLES)
+@app.command(name="import", help="Import a launch profile from JSON.")
 def import_cmd(
     profile: str = typer.Argument(..., help="Path to profile JSON"),
 ):
@@ -424,9 +426,22 @@ def import_cmd(
     console.print(table)
 
 
+def _version_callback(value: bool) -> None:
+    """Print the package version and exit when --version is passed."""
+    if value:
+        from . import __version__
+
+        console.print(f"llama-autotune {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
 def main_callback(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True,
+        help="Show version and exit",
+    ),
 ):
     """Configure global logging for the CLI.
 
@@ -435,6 +450,7 @@ def main_callback(
 
     Args:
         verbose: Enable verbose DEBUG-level logging.
+        version: Print version and exit.
 
     Returns:
         None.

@@ -8,36 +8,65 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
 
+import psutil
+
 from .models import BenchmarkResult, SearchConfig
 
 
-def find_llama_bench() -> str:
-    """Locate the llama-bench.exe executable.
+def binary_name(base: str) -> str:
+    """Return the platform-specific executable name for a llama.cpp tool.
 
-    Checks the ``LLAMA_CPP_DIR`` environment variable first, then falls
-    back to several relative paths derived from the current file's
-    location.  Returns the first existing file found.
+    Args:
+        base: Base tool name, e.g. ``"llama-bench"``.
 
     Returns:
-        Absolute path to llama-bench.exe, or ``"llama-bench.exe"`` as a
-        last resort if none of the candidates exist.
+        ``"<base>.exe"`` on Windows, ``base`` unchanged elsewhere.
     """
-    candidates = [
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", "llama-bench.exe"),
-        os.path.join(os.path.dirname(__file__), "..", "..", "llama-bench.exe"),
-    ]
+    return f"{base}.exe" if os.name == "nt" else base
+
+
+def find_llama_binary(base: str) -> str:
+    """Locate a llama.cpp executable by base name.
+
+    Checks the ``LLAMA_CPP_DIR`` environment variable first, then several
+    relative paths derived from the current file's location, and finally
+    the system ``PATH``.
+
+    Args:
+        base: Base tool name, e.g. ``"llama-bench"`` or ``"llama-server"``.
+
+    Returns:
+        Absolute path to the executable, or the bare platform-specific
+        name as a last resort if none of the candidates exist.
+    """
+    exe = binary_name(base)
+    candidates = []
     env_val = os.environ.get("LLAMA_CPP_DIR")
     if env_val:
-        candidates.insert(0, os.path.join(env_val, "llama-bench.exe"))
+        candidates.append(os.path.join(env_val, exe))
+    candidates.extend([
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", exe),
+        os.path.join(os.path.dirname(__file__), "..", "..", exe),
+    ])
     for c in candidates:
         resolved = os.path.abspath(c)
         if os.path.isfile(resolved):
             return resolved
-    return "llama-bench.exe"
+    return shutil.which(exe) or exe
+
+
+def find_llama_bench() -> str:
+    """Locate the llama-bench executable.
+
+    Returns:
+        Absolute path to llama-bench (see :func:`find_llama_binary`).
+    """
+    return find_llama_binary("llama-bench")
 
 
 def run_benchmark(
@@ -84,27 +113,31 @@ def run_benchmark(
 
     try:
         start = time.time()
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
+        peak_rss_mb = _watch_process(proc, timeout)
+        stdout, stderr = proc.communicate()
         elapsed = time.time() - start
         result.startup_time = elapsed
-        result.raw_output = proc.stdout
+        result.raw_output = stdout
 
         if proc.returncode != 0:
             result.success = False
-            result.raw_output += f"\nSTDERR: {proc.stderr}"
+            result.raw_output += f"\nSTDERR: {stderr}"
             return result
 
-        parsed = _parse_benchmark_output(proc.stdout)
+        parsed = _parse_benchmark_output(stdout)
         if parsed:
             result.prompt_tps = parsed.get("prompt_tps", 0.0)
             result.generation_tps = parsed.get("generation_tps", 0.0)
-            result.memory_usage = parsed.get("memory_usage", 0.0)
+            # llama-bench does not report memory usage in its JSON output,
+            # so fall back to the observed peak RSS of the subprocess.
+            result.memory_usage = parsed.get("memory_usage", 0.0) or peak_rss_mb
             result.success = True
         else:
             result.success = False
@@ -120,6 +153,45 @@ def run_benchmark(
         result.raw_output = f"[ERROR] {e}"
 
     return result
+
+
+def _watch_process(proc: subprocess.Popen, timeout: int) -> float:
+    """Track a subprocess until it exits, recording its peak memory usage.
+
+    Polls the process (and its children) via psutil while waiting. Kills
+    the process and raises ``subprocess.TimeoutExpired`` when the timeout
+    is exceeded.
+
+    Args:
+        proc: The running subprocess.
+        timeout: Maximum wall-clock seconds to wait.
+
+    Returns:
+        Peak resident set size in megabytes (0.0 if it could not be read).
+    """
+    start = time.time()
+    peak_rss = 0
+    try:
+        ps = psutil.Process(proc.pid)
+    except psutil.Error:
+        ps = None
+
+    while proc.poll() is None:
+        if time.time() - start > timeout:
+            proc.kill()
+            proc.communicate()
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        if ps is not None:
+            try:
+                rss = ps.memory_info().rss
+                for child in ps.children(recursive=True):
+                    rss += child.memory_info().rss
+                peak_rss = max(peak_rss, rss)
+            except psutil.Error:
+                pass
+        time.sleep(0.25)
+
+    return round(peak_rss / (1024**2), 1)
 
 
 def _parse_benchmark_output(output: str) -> dict | None:
