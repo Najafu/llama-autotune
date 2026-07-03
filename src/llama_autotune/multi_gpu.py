@@ -6,7 +6,7 @@ various tensor-split ratios for multi-GPU setups.
 
 from __future__ import annotations
 
-from .models import HardwareInfo, SearchConfig
+from .models import HardwareInfo, SearchConfig, SplitMode
 
 
 def tune_tensor_split(hw: HardwareInfo) -> list[SearchConfig]:
@@ -28,7 +28,7 @@ def tune_tensor_split(hw: HardwareInfo) -> list[SearchConfig]:
 
     for ratio in ratios:
         cfg = SearchConfig()
-        cfg.split_mode = "layer"
+        cfg.split_mode = SplitMode.LAYER
         cfg.tensor_split = ratio
         configs.append(cfg)
 
@@ -78,5 +78,5 @@ def apply_multi_gpu_config(config: SearchConfig, hw: HardwareInfo) -> SearchConf
         return config
     cfg = config.model_copy()
     if cfg.split_mode is None:
-        cfg.split_mode = "layer"
+        cfg.split_mode = SplitMode.LAYER
     return cfg

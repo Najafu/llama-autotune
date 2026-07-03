@@ -6,7 +6,7 @@ detected hardware and model properties, without running benchmarks.
 
 from __future__ import annotations
 
-from .models import Backend, HardwareInfo, ModelInfo, SearchConfig
+from .models import Backend, HardwareInfo, ModelInfo, SearchConfig, SplitMode
 
 
 def generate_initial_config(hw: HardwareInfo, model: ModelInfo) -> SearchConfig:
@@ -82,7 +82,7 @@ def _configure_gpu(config: SearchConfig, hw: HardwareInfo) -> None:
     """
     config.threads = max(1, min(hw.logical_cores, hw.physical_cores))
     if hw.gpu_count > 1:
-        config.split_mode = "layer"
+        config.split_mode = SplitMode.LAYER
 
 
 def to_cpu_config(config: SearchConfig) -> SearchConfig:

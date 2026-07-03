@@ -166,5 +166,5 @@ def config_from_params(params: dict[str, Any], base: SearchConfig | None = None)
     cfg = base.model_copy() if base is not None else SearchConfig()
     for key, value in params.items():
         if hasattr(cfg, key):
-            setattr(cfg, key, value)
+            cfg = SearchConfig.model_validate({**cfg.model_dump(), key: value})
     return cfg
