@@ -1,6 +1,6 @@
 [project]
 name = "llama-autotune"
-version = "0.3.0"
+version = "0.4.0"
 description = "Benchmarking and optimization tool for llama.cpp"
 readme = "README.md"
 license = {text = "MIT"}
@@ -22,10 +22,8 @@ dependencies = [
     "typer>=0.15",
     "pydantic>=2.0",
     "rich>=13.0",
-    "sqlalchemy>=2.0",
     "optuna>=4.0",
     "psutil>=6.0",
-    "structlog>=24.0",
 ]
 
 [project.urls]

@@ -69,6 +69,7 @@ def create_profile(
     model_path: str,
     hardware: str,
     score: float = 0.0,
+    llama_build: int = 0,
 ) -> LaunchProfile:
     """Create a new ``LaunchProfile`` with the current timestamp.
 
@@ -78,6 +79,7 @@ def create_profile(
         model_path: Path to the model file.
         hardware: Human-readable hardware description.
         score: Optional quality score (default 0.0).
+        llama_build: llama.cpp build the arguments were rendered for.
 
     Returns:
         A new ``LaunchProfile`` instance.
@@ -89,4 +91,5 @@ def create_profile(
         hardware=hardware,
         created=datetime.now(timezone.utc).isoformat(),
         score=score,
+        llama_build=llama_build,
     )

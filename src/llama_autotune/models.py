@@ -20,6 +20,8 @@ class Backend(str, Enum):
     ROCM = "rocm"
     VULKAN = "vulkan"
     METAL = "metal"
+    SYCL = "sycl"
+    OPENCL = "opencl"
     CPU = "cpu"
 
 
@@ -66,12 +68,34 @@ class HardwareInfo(BaseModel):
     cpu_name: str = ""
     physical_cores: int = 0
     logical_cores: int = 0
+    performance_cores: int = 0
+    efficiency_cores: int = 0
+    performance_threads: int = 0
     ram_gb: float = 0.0
+    ram_available_gb: float = 0.0
     gpu_count: int = 0
     gpu_vendor: GpuVendor = GpuVendor.UNKNOWN
     gpu_models: list[str] = []
     vram_per_gpu: list[float] = []
     backend: Backend = Backend.CPU
+    cpu_variant: str = ""
+    isa_tier: str = ""
+
+
+class KVLayout(BaseModel):
+    """Per-token KV-cache geometry, summed over the layers that own a cache.
+
+    Element counts are per token of context; multiply by the bytes per
+    element of the chosen cache type. Sliding-window layers only hold
+    ``swa_window`` (+ one ubatch) cells regardless of context size.
+    """
+
+    k_elems_full: int = 0
+    v_elems_full: int = 0
+    k_elems_swa: int = 0
+    v_elems_swa: int = 0
+    swa_window: int = 0
+    recurrent_bytes: int = 0
 
 
 class ModelInfo(BaseModel):
@@ -84,12 +108,20 @@ class ModelInfo(BaseModel):
     architecture: str = ""
     parameters: int = 0
     quantization: str = ""
+    quantization_declared: str = ""
     n_layers: int = 0
     n_heads: int = 0
     training_context: int = 0
     is_moe: bool = False
     active_parameters: int = 0
     file_size_gb: float = 0.0
+    n_embd: int = 0
+    vocab_size: int = 0
+    tensor_bytes: int = 0
+    bytes_per_token: int = 0
+    tensor_types: dict[str, int] = {}
+    kv_layout: KVLayout | None = None
+    fingerprint: str = ""
 
 
 class BenchmarkResult(BaseModel):
@@ -99,16 +131,31 @@ class BenchmarkResult(BaseModel):
     generation_tps: float = 0.0
     startup_time: float = 0.0
     memory_usage: float = 0.0
+    min_available_mb: float = 0.0
     success: bool = False
+    error: str = ""
     raw_output: str = ""
 
 
-class SearchConfig(BaseModel):
-    """A full set of llama.cpp parameters to benchmark or launch with.
+class LoadMode(str, Enum):
+    """Model loading modes of llama.cpp's ``--load-mode`` option."""
 
-    Every field is optional (None = use llama.cpp's default). Use
-    :meth:`to_bench_args` for llama-bench and :meth:`to_llama_args`
-    for llama-server.
+    AUTO = "auto"
+    NONE = "none"
+    MMAP = "mmap"
+    MLOCK = "mlock"
+    MMAP_MLOCK = "mmap+mlock"
+    DIRECT_IO = "dio"
+
+
+class SearchConfig(BaseModel):
+    """A typed set of llama.cpp settings to benchmark or launch with.
+
+    Every field is optional (None = leave llama.cpp's default). The
+    config is an intent, not a command line: how each setting is spelled
+    depends on the installed llama.cpp build, so argument lists are built
+    by :mod:`llama_autotune.compat`. :meth:`to_bench_args` and
+    :meth:`to_llama_args` render with the current llama.cpp spelling.
     """
 
     threads: int | None = None
@@ -123,70 +170,37 @@ class SearchConfig(BaseModel):
     main_gpu: int | None = None
     cache_type_k: str | None = None
     cache_type_v: str | None = None
-    mmap: bool | None = None
-    mlock: bool | None = None
+    load_mode: LoadMode | None = None
+    repack: bool | None = None
     numa: str | None = None
     cpu_affinity: str | None = None
     parallel: int | None = None
     no_kv_offload: bool | None = None
+    n_cpu_moe: int | None = None
+    cache_ram_mib: int | None = None
+    ctx_checkpoints: int | None = None
+    no_mmproj: bool | None = None
+    spec_type: str | None = None
 
     def to_bench_args(self) -> list[str]:
-        """Convert to command-line arguments for ``llama-bench``.
-
-        Only includes flags that ``llama-bench`` actually accepts
-        (omits context size, numa, mlock, etc.).
+        """Render as ``llama-bench`` arguments using current llama.cpp flags.
 
         Returns:
             List of CLI arguments.
         """
-        args = []
-        if self.threads is not None:
-            args.extend(["-t", str(self.threads)])
-        if self.threads_batch is not None:
-            args.extend(["-tb", str(self.threads_batch)])
-        if self.batch_size is not None:
-            args.extend(["-b", str(self.batch_size)])
-        if self.ubatch_size is not None:
-            args.extend(["-ub", str(self.ubatch_size)])
-        if self.n_gpu_layers is not None:
-            args.extend(["-ngl", str(self.n_gpu_layers)])
-        if self.flash_attn is not None:
-            args.extend(["-fa", "1" if self.flash_attn else "0"])
-        if self.tensor_split is not None:
-            args.extend(["-ts", self.tensor_split])
-        if self.split_mode is not None:
-            args.extend(["-sm", self.split_mode.value])
-        if self.main_gpu is not None:
-            args.extend(["-mg", str(self.main_gpu)])
-        if self.cache_type_k is not None:
-            args.extend(["-ctk", self.cache_type_k])
-        if self.cache_type_v is not None:
-            args.extend(["-ctv", self.cache_type_v])
-        if self.mmap is not None:
-            args.extend(["-mmp", "1" if self.mmap else "0"])
-        return args
+        from .compat import render_args
+
+        return render_args(self, "bench").args
 
     def to_llama_args(self) -> list[str]:
-        """Convert to command-line arguments for ``llama-server``.
-
-        Extends :meth:`to_bench_args` with server-specific flags
-        like context size, numa, and parallel.
+        """Render as ``llama-server`` arguments using current llama.cpp flags.
 
         Returns:
             List of CLI arguments.
         """
-        args = self.to_bench_args()
-        if self.ctx_size is not None:
-            args.extend(["-c", str(self.ctx_size)])
-        if self.mlock is not None:
-            args.extend(["--mlock"])
-        if self.numa is not None:
-            args.extend(["--numa", self.numa])
-        if self.parallel is not None:
-            args.extend(["--parallel", str(self.parallel)])
-        if self.no_kv_offload is not None:
-            args.extend(["-nkvo", "1" if self.no_kv_offload else "0"])
-        return args
+        from .compat import render_args
+
+        return render_args(self, "server").args
 
 
 class BenchmarkEntry(BaseModel):
@@ -198,10 +212,16 @@ class BenchmarkEntry(BaseModel):
     result: BenchmarkResult = Field(default_factory=BenchmarkResult)
     objective: OptimizeObjective = OptimizeObjective.BALANCED
     timestamp: str = ""
+    llama_build: int = 0
+    model_path: str = ""
 
 
 class LaunchProfile(BaseModel):
-    """A reusable launch profile exported to or imported from JSON."""
+    """A reusable launch profile exported to or imported from JSON.
+
+    ``llama_build`` records the llama.cpp build the profile was tuned on,
+    so a profile can be retested after llama.cpp is upgraded.
+    """
 
     name: str = ""
     args: list[str] = []
@@ -209,3 +229,4 @@ class LaunchProfile(BaseModel):
     hardware: str = ""
     created: str = ""
     score: float = 0.0
+    llama_build: int = 0

@@ -65,3 +65,31 @@ def test_config_no_training_ctx():
     model.training_context = 0
     cfg = generate_initial_config(_cpu_hw(), model)
     assert cfg.ctx_size == 4096
+
+
+def test_hybrid_cpu_uses_performance_cores_only():
+    hw = _cpu_hw()
+    hw.physical_cores, hw.performance_cores, hw.efficiency_cores = 14, 6, 8
+    assert generate_initial_config(hw, _model()).threads == 6
+
+
+def test_launch_defaults_for_8gb_pc():
+    from llama_autotune.heuristics import apply_launch_defaults
+    from llama_autotune.models import KVLayout, SearchConfig
+
+    hw = _cpu_hw()
+    hw.ram_gb = 7.9
+    model = _model()
+    model.kv_layout = KVLayout(k_elems_full=1, v_elems_full=1, swa_window=512)
+    cfg = apply_launch_defaults(SearchConfig(ctx_size=4096), hw, model)
+    assert (cfg.parallel, cfg.cache_ram_mib, cfg.ctx_checkpoints, cfg.no_mmproj) == (1, 0, 2, True)
+
+
+def test_launch_defaults_keep_explicit_values_and_images():
+    from llama_autotune.heuristics import apply_launch_defaults
+    from llama_autotune.models import SearchConfig
+
+    cfg = apply_launch_defaults(SearchConfig(parallel=4), _cpu_hw(), _model(), want_images=True)
+    assert cfg.parallel == 4
+    assert cfg.no_mmproj is None
+    assert cfg.cache_ram_mib is None          # 64 GB machine keeps llama.cpp's default

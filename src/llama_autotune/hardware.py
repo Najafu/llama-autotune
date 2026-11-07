@@ -1,271 +1,152 @@
 """Cross-platform hardware detection.
 
-Detects CPU (cores, name), RAM, and GPU (vendor, model, VRAM) using
-platform-native tools: WMI on Windows, nvidia-smi / rocm-smi on Linux,
-system_profiler on macOS. Falls back to ``llama-bench --list-devices``
-to verify that detected GPUs are actually usable by llama.cpp.
+What llama.cpp itself reports is the authority: the devices listed by
+``--list-devices`` decide the backend and VRAM, and the CPU variant it
+loads decides the instruction-set tier. OS probes fill in the rest (CPU
+name, core topology, RAM). WMI ``AdapterRAM`` is not used for VRAM
+because it is a 32-bit field that misreports cards above 4 GB.
 """
 
 from __future__ import annotations
 
-import os
+import hashlib
+import json
 import platform
-import re
 import subprocess
 import sys
 
-import psutil
-
+from .compat import _NO_WINDOW, Capabilities, detect_capabilities
 from .models import Backend, GpuVendor, HardwareInfo
+from .resources import cpu_topology, memory_status
+
+GIB = 1024**3
 
 
-def detect_hardware() -> HardwareInfo:
-    """Detect all hardware on the current machine.
+def detect_hardware(caps: Capabilities | None = None, probe_llama: bool = True) -> HardwareInfo:
+    """Detect the hardware of the current machine.
 
-    Gathers CPU, RAM, and GPU information, then verifies that any
-    detected GPU backend is actually usable by llama.cpp.
+    Args:
+        caps: Capabilities of the installed llama.cpp build; probed when
+            None and ``probe_llama`` is True.
+        probe_llama: Ask llama.cpp for its devices and CPU variant. When
+            False, GPUs are guessed from OS names (informational only).
 
     Returns:
-        A populated :class:`HardwareInfo` instance.
+        A populated :class:`HardwareInfo`.
     """
-    info = HardwareInfo()
+    info = HardwareInfo(cpu_name=_get_cpu_name())
+    topo = cpu_topology()
+    info.physical_cores = topo.physical_cores
+    info.logical_cores = topo.logical_cores
+    info.performance_cores = topo.performance_cores
+    info.efficiency_cores = topo.efficiency_cores
+    info.performance_threads = topo.performance_logical
+    mem = memory_status()
+    info.ram_gb = round(mem.total / GIB, 1)
+    info.ram_available_gb = round(mem.available / GIB, 2)
 
-    _detect_cpu(info)
-    _detect_ram(info)
-    _detect_gpu(info)
+    if caps is None and probe_llama:
+        caps = detect_capabilities()
+    if caps is not None:
+        # Only devices llama.cpp lists can be used; an empty list means CPU,
+        # even if the OS reports a GPU (or the probe timed out).
+        info.cpu_variant, info.isa_tier = caps.cpu_variant, caps.isa_tier
+        for dev in caps.devices:
+            info.gpu_count += 1
+            info.gpu_models.append(dev.description)
+            info.vram_per_gpu.append(round(dev.total_mib / 1024, 1))
+            info.gpu_vendor = _classify_gpu(dev.description)
+        info.backend = _backend_from_devices([d.name for d in caps.devices])
+        return info
+
+    _detect_gpu_names(info)
     _determine_backend(info)
-    _verify_gpu_backend(info)
-
     return info
 
 
-def _detect_cpu(info: HardwareInfo) -> None:
-    """Populate CPU name, physical core count, and logical core count."""
-    info.physical_cores = psutil.cpu_count(logical=False) or 0
-    info.logical_cores = psutil.cpu_count(logical=True) or 0
-    info.cpu_name = _get_cpu_name()
+def hardware_fingerprint(hw: HardwareInfo) -> str:
+    """Stable id for a machine: CPU, total RAM, GPUs and OS."""
+    data = json.dumps([hw.cpu_name, round(hw.ram_gb), sorted(hw.gpu_models), platform.system(), platform.release()])
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+def _backend_from_devices(names: list[str]) -> Backend:
+    for prefix, backend in (("CUDA", Backend.CUDA), ("ROCm", Backend.ROCM), ("HIP", Backend.ROCM),
+                            ("Metal", Backend.METAL), ("MTL", Backend.METAL), ("Vulkan", Backend.VULKAN),
+                            ("SYCL", Backend.SYCL), ("OpenCL", Backend.OPENCL)):
+        if any(n.startswith(prefix) for n in names):
+            return backend
+    return Backend.CPU
 
 
 def _get_cpu_name() -> str:
-    """Retrieve the CPU model name via platform-specific commands.
-
-    Uses PowerShell (Windows), lscpu (Linux), or sysctl (macOS).
-
-    Returns:
-        CPU model string, or fallback from ``platform.processor()``.
-    """
     if sys.platform == "win32":
         try:
-            output = subprocess.check_output(
-                [
-                    "powershell",
-                    "-Command",
-                    "(Get-CimInstance Win32_Processor).Name",
-                ],
-                text=True,
-                timeout=10,
-            )
-            return output.strip()
-        except Exception:
-            return platform.processor()
-    elif sys.platform == "linux":
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                return str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+        except OSError:
+            pass
+    elif sys.platform.startswith("linux"):
         try:
-            output = subprocess.check_output(
-                ["lscpu"], text=True, timeout=10
-            )
-            for line in output.splitlines():
-                if "Model name" in line:
-                    return line.split(":")[-1].strip()
-        except Exception:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
             pass
     elif sys.platform == "darwin":
         try:
-            output = subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                text=True,
-                timeout=10,
-            )
-            return output.strip()
-        except Exception:
+            return subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True, timeout=10).strip()
+        except (OSError, subprocess.SubprocessError):
             pass
-    return platform.processor()
+    return platform.processor() or "unknown CPU"
 
 
-def _detect_ram(info: HardwareInfo) -> None:
-    """Populate total system RAM in gigabytes."""
-    mem = psutil.virtual_memory()
-    info.ram_gb = round(mem.total / (1024**3), 1)
-
-
-def _detect_gpu(info: HardwareInfo) -> None:
-    """Detect GPU(s) by dispatching to the platform-specific detector."""
-    if sys.platform == "win32":
-        _detect_gpu_windows(info)
-    elif sys.platform == "linux":
-        _detect_gpu_linux(info)
-    elif sys.platform == "darwin":
-        _detect_gpu_macos(info)
-
-
-def _detect_gpu_windows(info: HardwareInfo) -> None:
-    """Enumerate GPUs via WMI (Win32_VideoController)."""
+def _detect_gpu_names(info: HardwareInfo) -> None:
+    """Fallback when llama.cpp is unavailable: GPU names only, no VRAM."""
+    names: list[str] = []
     try:
-        output = subprocess.check_output(
-            [
-                "powershell",
-                "-Command",
-                "Get-CimInstance Win32_VideoController | "
-                "Select-Object Name, AdapterRAM | ConvertTo-Json",
-            ],
-            text=True,
-            timeout=15,
-        )
-        import json
-
-        data = json.loads(output)
-        if not isinstance(data, list):
-            data = [data]
-
-        for gpu in data:
-            name = gpu.get("Name", "") or ""
-            ram_bytes = gpu.get("AdapterRAM") or 0
-            vram_gb = round(ram_bytes / (1024**3), 1) if ram_bytes else 0.0
-
-            vendor = _classify_gpu(name)
-            if vendor != GpuVendor.UNKNOWN:
-                info.gpu_count += 1
-                info.gpu_models.append(name)
-                info.vram_per_gpu.append(vram_gb)
-                info.gpu_vendor = vendor
-    except Exception:
-        pass
-
-
-def _detect_gpu_linux(info: HardwareInfo) -> None:
-    """Enumerate GPUs via nvidia-smi and rocm-smi on Linux."""
-    try:
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            text=True,
-            timeout=10,
-        )
-        for line in output.strip().splitlines():
-            parts = line.split(",")
-            if len(parts) >= 2:
-                name = parts[0].strip()
-                mem_str = parts[1].strip().lower().replace("mib", "").strip()
-                try:
-                    vram_gb = round(float(mem_str) / 1024, 1)
-                except ValueError:
-                    vram_gb = 0.0
-                info.gpu_count += 1
-                info.gpu_models.append(name)
-                info.vram_per_gpu.append(vram_gb)
-                info.gpu_vendor = GpuVendor.NVIDIA
-    except Exception:
-        pass
-    if info.gpu_count == 0:
-        try:
-            output = subprocess.check_output(
-                ["rocm-smi", "--showproductinfo"], text=True, timeout=10
-            )
-            for line in output.splitlines():
-                m = re.search(r"Name:\s+(.+)", line)
-                if m:
-                    info.gpu_count += 1
-                    info.gpu_models.append(m.group(1).strip())
-                    info.gpu_vendor = GpuVendor.AMD
-        except Exception:
-            pass
-    if info.gpu_count == 0:
-        try:
-            output = subprocess.check_output(
-                ["vulkaninfo", "--summary"], text=True, timeout=15
-            )
-            for line in output.splitlines():
-                if "GPU" in line and ":" in line:
-                    info.gpu_count += 1
-                    info.gpu_models.append(line.split(":")[-1].strip())
-                    info.gpu_vendor = GpuVendor.UNKNOWN
-        except Exception:
-            pass
-
-
-def _detect_gpu_macos(info: HardwareInfo) -> None:
-    """Enumerate GPUs via system_profiler on macOS."""
-    try:
-        output = subprocess.check_output(
-            ["system_profiler", "SPDisplaysDataType"],
-            text=True,
-            timeout=15,
-        )
-        for line in output.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("Chipset Model"):
-                name = stripped.split(":")[-1].strip()
-                info.gpu_count += 1
-                info.gpu_models.append(name)
-                info.gpu_vendor = _classify_gpu(name)
-    except Exception:
-        info.gpu_vendor = GpuVendor.APPLE
+        if sys.platform == "win32":
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_VideoController).Name"],
+                text=True, timeout=15, creationflags=_NO_WINDOW)
+            names = [n.strip() for n in out.splitlines() if n.strip()]
+        elif sys.platform.startswith("linux"):
+            out = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                                          text=True, timeout=10)
+            names = [n.strip() for n in out.splitlines() if n.strip()]
+    except (OSError, subprocess.SubprocessError):
+        names = []
+    for name in names:
+        vendor = _classify_gpu(name)
+        if vendor != GpuVendor.UNKNOWN:
+            info.gpu_count += 1
+            info.gpu_models.append(name)
+            info.gpu_vendor = vendor
 
 
 def _classify_gpu(name: str) -> GpuVendor:
-    """Classify a GPU vendor by keyword matching on its name string.
-
-    Args:
-        name: GPU model name from the OS.
-
-    Returns:
-        The matching :class:`GpuVendor`, or UNKNOWN.
-    """
-    name_lower = name.lower()
-    if any(x in name_lower for x in ["nvidia", "geforce", "rtx", "gtx", "tesla", "quadro"]):
+    """Classify a GPU vendor by keywords in its name."""
+    n = name.lower()
+    if any(x in n for x in ("nvidia", "geforce", "rtx", "gtx", "tesla", "quadro")):
         return GpuVendor.NVIDIA
-    if any(x in name_lower for x in ["amd", "radeon", "rx ", "w7600", "w7800", "instinct"]):
+    if any(x in n for x in ("amd", "radeon", "rx ", "instinct")):
         return GpuVendor.AMD
-    if any(x in name_lower for x in ["intel", "arc", "iris", "uhd", "xe"]):
+    if any(x in n for x in ("intel", "arc", "iris", "uhd")):
         return GpuVendor.INTEL
-    if any(x in name_lower for x in ["apple", "m1", "m2", "m3", "m4", "m5"]):
+    if any(x in n for x in ("apple", "m1", "m2", "m3", "m4", "m5")):
         return GpuVendor.APPLE
     return GpuVendor.UNKNOWN
 
 
 def _determine_backend(info: HardwareInfo) -> None:
-    """Map GPU vendor to a llama.cpp backend string."""
-    if info.gpu_vendor == GpuVendor.NVIDIA:
-        info.backend = Backend.CUDA
-    elif info.gpu_vendor == GpuVendor.AMD:
-        info.backend = Backend.ROCM
-    elif info.gpu_vendor == GpuVendor.INTEL:
-        info.backend = Backend.VULKAN
-    elif info.gpu_vendor == GpuVendor.APPLE:
-        info.backend = Backend.METAL
-    else:
-        info.backend = Backend.CPU
-
-
-def _verify_gpu_backend(info: HardwareInfo) -> None:
-    """Cross-check GPU backend against ``llama-bench --list-devices``.
-
-    If llama-bench reports no usable GPU devices, forces the backend
-    to CPU to avoid generating invalid GPU configurations.
-    """
-    if info.backend == Backend.CPU:
-        return
-    try:
-        from .benchmark import find_llama_bench
-
-        bench_path = find_llama_bench()
-        result = subprocess.run(
-            [bench_path, "--list-devices"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        if "none" in result.stdout.lower() and "gpu" not in result.stdout.lower():
-            info.backend = Backend.CPU
-            info.gpu_count = 0
-            info.gpu_models = []
-            info.vram_per_gpu = []
-    except Exception:
-        pass
+    """Fallback backend guess from the GPU vendor (no llama.cpp available)."""
+    info.backend = {
+        GpuVendor.NVIDIA: Backend.CUDA,
+        GpuVendor.AMD: Backend.ROCM,
+        GpuVendor.INTEL: Backend.VULKAN,
+        GpuVendor.APPLE: Backend.METAL,
+    }.get(info.gpu_vendor, Backend.CPU)

@@ -1,63 +1,28 @@
 """Subprocess wrapper around llama-bench.
 
-Provides functions to locate the llama-bench executable, run benchmarks
-against a given model, and parse the JSON output into structured results.
+Runs benchmarks with arguments rendered by the compatibility layer,
+guards every run with a RAM watchdog, and parses llama-bench's JSON
+output into structured results.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
+import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import psutil
 
+from .compat import FlagRegistry, binary_name, clean_env, find_llama_binary, render_args
 from .models import BenchmarkResult, SearchConfig
 
+__all__ = ["binary_name", "find_llama_binary", "find_llama_bench", "run_benchmark"]
 
-def binary_name(base: str) -> str:
-    """Return the platform-specific executable name for a llama.cpp tool.
-
-    Args:
-        base: Base tool name, e.g. ``"llama-bench"``.
-
-    Returns:
-        ``"<base>.exe"`` on Windows, ``base`` unchanged elsewhere.
-    """
-    return f"{base}.exe" if os.name == "nt" else base
-
-
-def find_llama_binary(base: str) -> str:
-    """Locate a llama.cpp executable by base name.
-
-    Checks the ``LLAMA_CPP_DIR`` environment variable first, then several
-    relative paths derived from the current file's location, and finally
-    the system ``PATH``.
-
-    Args:
-        base: Base tool name, e.g. ``"llama-bench"`` or ``"llama-server"``.
-
-    Returns:
-        Absolute path to the executable, or the bare platform-specific
-        name as a last resort if none of the candidates exist.
-    """
-    exe = binary_name(base)
-    candidates = []
-    env_val = os.environ.get("LLAMA_CPP_DIR")
-    if env_val:
-        candidates.append(os.path.join(env_val, exe))
-    candidates.extend([
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", exe),
-        os.path.join(os.path.dirname(__file__), "..", "..", exe),
-    ])
-    for c in candidates:
-        resolved = os.path.abspath(c)
-        if os.path.isfile(resolved):
-            return resolved
-    return shutil.which(exe) or exe
+DEFAULT_MIN_AVAILABLE_MIB = 400
 
 
 def find_llama_bench() -> str:
@@ -77,121 +42,179 @@ def run_benchmark(
     n_prompt: int = 512,
     n_gen: int = 128,
     no_warmup: bool = False,
+    n_depth: int = 0,
+    registry: FlagRegistry | None = None,
+    min_available_mib: int = DEFAULT_MIN_AVAILABLE_MIB,
 ) -> BenchmarkResult:
     """Execute llama-bench for a given model and return the results.
 
-    Runs the benchmark subprocess with the specified model, optional
-    configuration, and number of repetitions.  The output is parsed from
-    JSON and written into a ``BenchmarkResult`` instance.
+    Arguments come from the compatibility layer, so only flags the
+    installed build accepts are used. ``LLAMA_ARG_*`` environment
+    variables are removed so they cannot silently change the result.
+    A watchdog stops the run when available RAM falls below
+    ``min_available_mib``.
 
     Args:
         model_path: Path to the model file to benchmark.
-        config: Optional ``SearchConfig`` whose extra arguments are
-            appended to the command line.
-        repetitions: Number of benchmark repetitions (passed via ``-r``).
-        timeout: Maximum time in seconds to wait for the subprocess.
-        n_prompt: Number of prompt tokens (passed via ``-p``).
-        n_gen: Number of generation tokens (passed via ``-n``).
-        no_warmup: If True, pass ``--no-warmup`` to skip warmup runs.
+        config: Settings to benchmark; None uses llama-bench defaults.
+        repetitions: Number of repetitions (``-r``).
+        timeout: Maximum seconds to wait for the subprocess.
+        n_prompt: Prompt tokens (``-p``).
+        n_gen: Generated tokens (``-n``).
+        no_warmup: Skip llama-bench's warmup run.
+        n_depth: Tokens already in the KV cache (``-d``); 0 omits the flag.
+        registry: Flags of the installed llama-bench; None renders the
+            current llama.cpp spelling.
+        min_available_mib: RAM floor for the watchdog.
 
     Returns:
-        A ``BenchmarkResult`` with ``success`` set to ``True`` on
-        success, or ``False`` with error details in ``raw_output`` on
-        failure.
+        A :class:`BenchmarkResult`. On failure ``success`` is False and
+        ``error`` says why (``timeout``, ``memory_guard``,
+        ``memory_guard_external``, ``not_found`` or ``failed``).
     """
     result = BenchmarkResult()
-
     bench_path = find_llama_bench()
-    model_path = str(model_path)
-
-    cmd = [bench_path, "-m", model_path, "-r", str(repetitions), "-o", "json",
+    cmd = [bench_path, "-m", str(model_path), "-r", str(repetitions), "-o", "json",
            "-p", str(n_prompt), "-n", str(n_gen)]
+    if n_depth:
+        cmd += ["-d", str(n_depth)]
     if no_warmup:
         cmd.append("--no-warmup")
     if config is not None:
-        cmd.extend(config.to_bench_args())
+        cmd.extend(render_args(config, "bench", registry).args)
+
+    available_mib = psutil.virtual_memory().available / (1024 * 1024)
+    if available_mib < min_available_mib:
+        result.error = "memory_guard_external"
+        result.min_available_mb = round(available_mib, 1)
+        result.raw_output = f"[MEMORY_GUARD_EXTERNAL] only {available_mib:.0f} MiB free before starting"
+        return result
 
     try:
-        start = time.time()
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        peak_rss_mb = _watch_process(proc, timeout)
-        stdout, stderr = proc.communicate()
-        elapsed = time.time() - start
-        result.startup_time = elapsed
-        result.raw_output = stdout
-
-        if proc.returncode != 0:
-            result.success = False
-            result.raw_output += f"\nSTDERR: {stderr}"
-            return result
-
-        parsed = _parse_benchmark_output(stdout)
-        if parsed:
-            result.prompt_tps = parsed.get("prompt_tps", 0.0)
-            result.generation_tps = parsed.get("generation_tps", 0.0)
-            # llama-bench does not report memory usage in its JSON output,
-            # so fall back to the observed peak RSS of the subprocess.
-            result.memory_usage = parsed.get("memory_usage", 0.0) or peak_rss_mb
-            result.success = True
-        else:
-            result.success = False
-
-    except subprocess.TimeoutExpired:
-        result.success = False
-        result.raw_output = "[TIMEOUT]"
+        with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as out, \
+             tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
+            start = time.time()
+            proc = subprocess.Popen(
+                cmd, stdout=out, stderr=err, env=clean_env(),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            watch = watch_process(proc, timeout, min_available_mib)
+            result.startup_time = time.time() - start
+            out.seek(0)
+            err.seek(0)
+            stdout, stderr = out.read(), err.read()
     except FileNotFoundError:
-        result.success = False
+        result.error = "not_found"
         result.raw_output = f"[ERROR] llama-bench not found at: {bench_path}"
-    except Exception as e:
-        result.success = False
-        result.raw_output = f"[ERROR] {e}"
+        return result
+    except OSError as e:
+        result.error = "failed"
+        result.raw_output = f"[ERROR] could not run llama-bench: {e}"
+        return result
 
+    result.raw_output = stdout
+    result.memory_usage = watch.peak_rss_mib
+    result.min_available_mb = watch.min_available_mib
+    if watch.stopped_by:
+        result.error = watch.stopped_by
+        result.raw_output = f"[{watch.stopped_by.upper()}] {watch.detail}\n{stderr[-2000:]}"
+        return result
+    if proc.returncode != 0:
+        result.error = "failed"
+        result.raw_output += f"\nSTDERR: {stderr[-4000:]}"
+        return result
+
+    parsed = _parse_benchmark_output(stdout)
+    if parsed:
+        result.prompt_tps = parsed.get("prompt_tps", 0.0)
+        result.generation_tps = parsed.get("generation_tps", 0.0)
+        result.success = True
+    else:
+        result.error = "failed"
     return result
 
 
-def _watch_process(proc: subprocess.Popen, timeout: int) -> float:
-    """Track a subprocess until it exits, recording its peak memory usage.
+@dataclass
+class WatchReport:
+    """What the watchdog observed while a process ran."""
 
-    Polls the process (and its children) via psutil while waiting. Kills
-    the process and raises ``subprocess.TimeoutExpired`` when the timeout
-    is exceeded.
+    peak_rss_mib: float = 0.0
+    min_available_mib: float = 0.0
+    stopped_by: str = ""
+    detail: str = ""
+
+
+def watch_process(proc: subprocess.Popen, timeout: float, min_available_mib: int) -> WatchReport:
+    """Watch a process until it exits; stop it on timeout or low RAM.
+
+    When available RAM falls below the floor the process is killed. The
+    stop is blamed on the process (``memory_guard``) only when available
+    RAM fell by a meaningful amount and the process itself accounts for at
+    least half of that drop. Otherwise another program took the memory, or
+    it was already low, and the stop is reported as
+    ``memory_guard_external`` so the caller can wait and retry instead of
+    rejecting the configuration.
 
     Args:
-        proc: The running subprocess.
-        timeout: Maximum wall-clock seconds to wait.
+        proc: The running process.
+        timeout: Seconds before the process is killed.
+        min_available_mib: Available-RAM floor in MiB.
 
     Returns:
-        Peak resident set size in megabytes (0.0 if it could not be read).
+        A :class:`WatchReport`.
     """
-    start = time.time()
-    peak_rss = 0
+    report = WatchReport()
+    mib = 1024 * 1024
     try:
         ps = psutil.Process(proc.pid)
     except psutil.Error:
         ps = None
+    start = time.time()
+    start_avail = psutil.virtual_memory().available
+    low = start_avail
+    peak = 0
+    children: list[psutil.Process] = []
+    polls = 0
 
     while proc.poll() is None:
         if time.time() - start > timeout:
-            proc.kill()
-            proc.communicate()
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+            report.stopped_by, report.detail = "timeout", f"no result after {timeout:.0f} s"
+            break
+        rss = 0
         if ps is not None:
             try:
+                if polls % 8 == 0:
+                    children = ps.children(recursive=True)
                 rss = ps.memory_info().rss
-                for child in ps.children(recursive=True):
-                    rss += child.memory_info().rss
-                peak_rss = max(peak_rss, rss)
+                for c in children:
+                    try:
+                        rss += c.memory_info().rss
+                    except psutil.Error:
+                        pass
             except psutil.Error:
                 pass
+        polls += 1
+        peak = max(peak, rss)
+        avail = psutil.virtual_memory().available
+        low = min(low, avail)
+        if avail < min_available_mib * mib:
+            drop = start_avail - avail
+            own = drop >= 64 * mib and rss >= drop * 0.5
+            report.stopped_by = "memory_guard" if own else "memory_guard_external"
+            report.detail = (f"available RAM fell to {avail // mib} MiB "
+                             f"(process used {rss // mib} MiB, system lost {max(drop, 0) // mib} MiB)")
+            break
         time.sleep(0.25)
 
-    return round(peak_rss / (1024**2), 1)
+    if report.stopped_by:
+        proc.kill()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+    report.peak_rss_mib = round(peak / mib, 1)
+    report.min_available_mib = round(low / mib, 1)
+    return report
 
 
 def _parse_benchmark_output(output: str) -> dict | None:
