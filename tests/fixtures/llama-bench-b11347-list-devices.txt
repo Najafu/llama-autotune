@@ -1,0 +1,6 @@
+load_backend: loaded RPC backend from C:\sandbox\llama\ggml-rpc.dll
+load_backend: loaded CPU backend from C:\sandbox\llama\ggml-cpu-haswell.dll
+load_backend: loaded RPC backend from C:\sandbox\llama\ggml-rpc.dll
+load_backend: loaded CPU backend from C:\sandbox\llama\ggml-cpu-haswell.dll
+Available devices:
+  (none)

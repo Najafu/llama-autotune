@@ -19,10 +19,13 @@ from typing import Any
 import optuna
 
 from .benchmark import run_benchmark
-from .constraints import detect_oom_in_output, is_plausible
+from .compat import detect_capabilities
+from .constraints import GateDecision, detect_oom_in_output, is_plausible, memory_budget, plan_memory
 from .hardware import detect_hardware
 from .heuristics import generate_initial_config, to_cpu_config
+from .memory import compute_buffer_for, tensor_sizes_of
 from .model_inspector import inspect_model
+from .resources import memory_status
 from .models import (
     Backend,
     BenchmarkResult,
@@ -75,9 +78,25 @@ class Optimizer:
 
             os.environ["LLAMA_CPP_DIR"] = llama_dir
 
-        self.hw: HardwareInfo = detect_hardware()
+        self.caps = detect_capabilities()
+        self.hw: HardwareInfo = detect_hardware(self.caps)
         self.model: ModelInfo = inspect_model(model_path)
         self._initial_config: SearchConfig = generate_initial_config(self.hw, self.model)
+        self.gate: GateDecision | None = None
+        self._memory_check: dict[str, Any] = {}
+        if self.hw.backend == Backend.CPU:
+            mem = memory_status()
+            ctx = self._initial_config.ctx_size or 4096
+            self._memory_check = {
+                "budget": memory_budget(mem.available, mem.total),
+                "tensor_sizes": tensor_sizes_of(model_path),
+                "compute_override": compute_buffer_for(model_path, ctx),
+            }
+            self.gate = plan_memory(
+                self.model, isa_tier=self.hw.isa_tier or "avx2", ctx=ctx,
+                ubatch=self._initial_config.ubatch_size or 512, **self._memory_check,
+            )
+            self._initial_config = self.gate.apply(self._initial_config)
         self._best_config: SearchConfig | None = None
         self._best_score: float = 0.0
         self._total_evals: int = 0
@@ -98,10 +117,11 @@ class Optimizer:
         ``_speed_tier``, ``_n_prompt``, ``_n_gen``, and ``_bench_reps``
         so that subsequent evaluations are scaled to the hardware.
         """
-        cfg = SearchConfig(threads=self.hw.physical_cores)
+        cfg = self._initial_config.model_copy()
         result = run_benchmark(self.model_path, cfg,
                                repetitions=1, timeout=30,
-                               n_prompt=16, n_gen=8, no_warmup=True)
+                               n_prompt=16, n_gen=8, no_warmup=True,
+                               registry=self.caps.bench)
         if not result.success:
             self._speed_tier = "very_slow"
             logger.info("Speed probe failed — tier: very_slow")
@@ -133,6 +153,10 @@ class Optimizer:
             no successful evaluation was produced.
         """
         logger.info(f"Starting optimization — model={self.model_path} objective={self.objective.value} hw={self.hw.cpu_name}")
+
+        if self.gate is not None and not self.gate.fits:
+            logger.warning("Model does not fit in available memory — not benchmarking")
+            return self._initial_config
 
         self._estimate_speed()
         if self._speed_tier == "very_slow":
@@ -232,7 +256,7 @@ class Optimizer:
                     break
                 cfg = self._best_config.model_copy() if self._best_config else SearchConfig()
                 setattr(cfg, param_name, val)
-                if not is_plausible(cfg, self.model, self.hw):
+                if not is_plausible(cfg, self.model, self.hw, **self._memory_check):
                     continue
                 result = self._evaluate(cfg)
                 if result.success:
@@ -256,12 +280,13 @@ class Optimizer:
         def objective_fn(trial: optuna.Trial) -> float:
             params: dict[str, Any] = {}
             for pname, pdef in space.items():
-                params[pname] = self._sample_param(trial, pname, pdef)
+                if pdef.measured:
+                    params[pname] = self._sample_param(trial, pname, pdef)
             cfg = config_from_params(params, self._best_config)
             # Pruning (rather than a sentinel score) keeps failed configs out
             # of best_value — a fixed sentinel would outrank legitimate
             # negative scores such as min_latency's -startup_time.
-            if not is_plausible(cfg, self.model, self.hw):
+            if not is_plausible(cfg, self.model, self.hw, **self._memory_check):
                 raise optuna.TrialPruned()
             result = self._evaluate(cfg)
             if not result.success:
@@ -302,9 +327,14 @@ class Optimizer:
             return self._cache[key]
 
         self._total_evals += 1
-        result = run_benchmark(self.model_path, config, timeout=900,
-                               n_prompt=self._n_prompt, n_gen=self._n_gen,
-                               repetitions=self._bench_reps)
+        for attempt in range(2):
+            result = run_benchmark(self.model_path, config, timeout=900,
+                                   n_prompt=self._n_prompt, n_gen=self._n_gen,
+                                   repetitions=self._bench_reps, registry=self.caps.bench)
+            if result.error != "memory_guard_external" or attempt:
+                break
+            logger.warning("Another program used RAM during the benchmark; retrying in 10 s")
+            time.sleep(10)
         self._cache[key] = result
 
         if detect_oom_in_output(result.raw_output):

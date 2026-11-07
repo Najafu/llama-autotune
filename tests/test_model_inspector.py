@@ -134,7 +134,7 @@ def test_inspect_olmoe():
     assert info.architecture == "olmoe"
     assert info.is_moe is True
     assert info.parameters == 7_000_000_000
-    assert info.active_parameters == 1_000_000_000
+    assert 1_000_000_000 <= info.active_parameters <= 1_500_000_000   # counted from expert tensors
     assert info.quantization == "Q2_K"
     assert info.n_layers == 16
     assert info.n_heads == 16

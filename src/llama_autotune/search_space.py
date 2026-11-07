@@ -24,6 +24,9 @@ class ParamDef:
         step: Step size for continuous parameters. ``None`` when *is_categorical* is True.
         is_categorical: Whether the parameter uses discrete *categories* instead of a range.
         categories: Explicit list of values when *is_categorical* is True.
+        measured: Whether llama-bench measures the parameter's effect. Context
+            size is not: llama-bench sizes its context from the test, so it is
+            decided by the memory gate instead of being searched.
     """
     name: str
     low: int | float
@@ -31,6 +34,7 @@ class ParamDef:
     step: int | float | None = None
     is_categorical: bool = False
     categories: list[Any] | None = None
+    measured: bool = True
 
 
 def get_search_space(
@@ -67,7 +71,10 @@ def _cpu_space(
 ) -> dict[str, ParamDef]:
     """Build the CPU-specific portion of the search space.
 
-    Currently only exposes the *threads* parameter.
+    Threads range from one below the performance-core count up to every
+    logical thread of the performance cores: on a 2-core/4-thread i3, 3
+    threads generated 22% faster than llama.cpp's default of 2, so
+    hyper-threads must be reachable. Efficiency cores stay excluded.
 
     Args:
         hw: Hardware information used to derive thread bounds.
@@ -77,11 +84,14 @@ def _cpu_space(
     Returns:
         Dictionary with CPU-related ``ParamDef`` entries.
     """
-    space = {}
-    min_threads = min(4, hw.physical_cores)
-    step = 1 if hw.physical_cores <= 4 else 2
-    space["threads"] = ParamDef("threads", min_threads, hw.physical_cores, step=step)
-    return space
+    perf = hw.performance_cores or hw.physical_cores or 1
+    if hw.efficiency_cores:
+        high = max(hw.performance_threads, perf)
+    else:
+        high = max(hw.logical_cores, perf)
+    low = max(1, perf - 1)
+    step = 1 if high - low <= 8 else 2
+    return {"threads": ParamDef("threads", low, high, step=step)}
 
 
 def _gpu_space(
@@ -124,9 +134,9 @@ def _memory_space(
     space = {}
     max_ctx = model.training_context if model.training_context > 0 else 8192
     if objective in (OptimizeObjective.MAX_CONTEXT,):
-        space["ctx_size"] = ParamDef("ctx_size", 4096, min(max_ctx, 131072), step=4096)
+        space["ctx_size"] = ParamDef("ctx_size", 4096, min(max_ctx, 131072), step=4096, measured=False)
     else:
-        space["ctx_size"] = ParamDef("ctx_size", 1024, min(max_ctx, 32768), step=1024)
+        space["ctx_size"] = ParamDef("ctx_size", 1024, min(max_ctx, 32768), step=1024, measured=False)
     return space
 
 

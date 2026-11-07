@@ -77,8 +77,7 @@ def test_search_config_to_llama_args():
     assert "12" in args
     assert "-b" in args
     assert "2048" in args
-    assert "-fa" in args
-    assert "1" in args
+    assert args[args.index("-fa") + 1] == "on"
 
 
 def test_search_config_empty():
