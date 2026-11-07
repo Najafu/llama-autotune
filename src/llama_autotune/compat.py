@@ -18,7 +18,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -225,7 +225,7 @@ def parse_cpu_variant(text: str) -> tuple[str, str]:
     m = _CPU_BACKEND.search(text)
     if not m:
         return "", ""
-    stem = Path(m.group(1)).stem
+    stem = PureWindowsPath(m.group(1)).stem
     stem = stem[3:] if stem.startswith("lib") else stem
     variant = stem.removeprefix("ggml-cpu").lstrip("-") or "native"
     if variant.startswith(("armv", "m1", "m2", "m3", "m4", "android")):
