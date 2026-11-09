@@ -43,12 +43,58 @@ def binary_name(base: str) -> str:
     return f"{base}.exe" if os.name == "nt" else base
 
 
+def config_path() -> Path:
+    """``~/.llama-autotune/config.json``: settings such as the llama.cpp folder."""
+    return Path.home() / ".llama-autotune" / "config.json"
+
+
+def saved_llama_dir() -> str:
+    """The llama.cpp folder saved by ``llama-autotune setup``, or ``""``."""
+    try:
+        return str(json.loads(config_path().read_text(encoding="utf-8")).get("llama_cpp_dir", ""))
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def save_llama_dir(folder: str) -> None:
+    """Remember the llama.cpp folder for every later command."""
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data["llama_cpp_dir"] = str(Path(folder).resolve())
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _build_in_name(path: Path) -> int:
+    m = re.search(r"-b(\d+)-", path.name)
+    return int(m.group(1)) if m else 0
+
+
+def common_llama_dirs() -> list[Path]:
+    """Folders where beginners usually unzip llama.cpp, newest download first.
+
+    The official Windows zips are named like ``llama-b12228-bin-win-cpu-x64``;
+    when several sit in Downloads, the highest build number wins.
+    """
+    home = Path.home()
+    fixed = [Path.cwd(), Path("C:/llama"), Path("C:/llama.cpp"), Path("C:/llamacpp"),
+             home / "llama", home / "llama.cpp", home / "llamacpp"] if os.name == "nt" else \
+            [Path.cwd(), home / "llama.cpp", home / "llama.cpp" / "build" / "bin", Path("/opt/llama.cpp")]
+    downloads = sorted((p for p in (home / "Downloads").glob("llama-*bin-*") if p.is_dir()),
+                       key=_build_in_name, reverse=True) if (home / "Downloads").is_dir() else []
+    return fixed + downloads
+
+
 def find_llama_binary(base: str) -> str:
     """Locate a llama.cpp executable by base name.
 
-    Checks the ``LLAMA_CPP_DIR`` environment variable first, then several
-    relative paths derived from the package location, and finally the
-    system ``PATH``.
+    Looks in this order: the ``LLAMA_CPP_DIR`` environment variable, the
+    folder saved by ``llama-autotune setup``, folders next to the package,
+    the system ``PATH``, and finally common unzip locations (``C:\\llama``,
+    the current folder, Downloads).
 
     Args:
         base: Base tool name, e.g. ``"llama-bench"`` or ``"llama-server"``.
@@ -59,9 +105,9 @@ def find_llama_binary(base: str) -> str:
     """
     exe = binary_name(base)
     candidates = []
-    env_val = os.environ.get("LLAMA_CPP_DIR")
-    if env_val:
-        candidates.append(os.path.join(env_val, exe))
+    for folder in (os.environ.get("LLAMA_CPP_DIR"), saved_llama_dir()):
+        if folder:
+            candidates.append(os.path.join(folder, exe))
     here = os.path.dirname(__file__)
     candidates.extend([
         os.path.join(here, "..", "..", "..", exe),
@@ -71,7 +117,24 @@ def find_llama_binary(base: str) -> str:
         resolved = os.path.abspath(c)
         if os.path.isfile(resolved):
             return resolved
-    return shutil.which(exe) or exe
+    on_path = shutil.which(exe)
+    if on_path:
+        return on_path
+    for folder in common_llama_dirs():
+        if (folder / exe).is_file():
+            return str((folder / exe).resolve())
+    return exe
+
+
+def llama_found(path: str) -> bool:
+    """True when a lookup above returned a real file, not the bare name."""
+    return os.path.isfile(path)
+
+
+NOT_FOUND_ADVICE = (
+    "llama.cpp was not found. Download the newest release from https://github.com/ggml-org/llama.cpp/releases "
+    "(for a PC without a GPU: the file ending in bin-win-cpu-x64.zip), unzip it, then run: "
+    "llama-autotune setup <the folder you unzipped to>")
 
 
 # ── parsing ───────────────────────────────────────────────────────────

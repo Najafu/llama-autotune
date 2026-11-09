@@ -36,7 +36,9 @@ from dataclasses import dataclass, field
 from statistics import median
 
 from .benchmark import BenchRecord, SweepResult, run_sweep
-from .compat import Capabilities, architecture_supported, detect_capabilities, update_llama_advice
+from .compat import (
+    NOT_FOUND_ADVICE, Capabilities, architecture_supported, detect_capabilities, update_llama_advice,
+)
 from .constraints import GateDecision, memory_budget, plan_memory
 from .hardware import detect_hardware
 from .memory import compute_model_for, kv_cache_bytes, repack_copy_bytes, tensor_sizes_of
@@ -82,10 +84,11 @@ def predict_generation_tps(model: ModelInfo, bandwidth_gbs: float, efficiency: f
                            depth: int = 0) -> float:
     """Predicted generation speed from memory bandwidth.
 
-    Every generated token reads the active weights once, plus the whole
-    KV cache filled so far (``depth`` tokens).
+    Every generated token reads the active weights once (for an MoE model
+    only the experts it uses), plus the whole KV cache filled so far
+    (``depth`` tokens).
     """
-    per_token = model.bytes_per_token or model.tensor_bytes
+    per_token = model.active_bytes_per_token or model.bytes_per_token or model.tensor_bytes
     if depth and model.kv_layout is not None:
         per_token += kv_cache_bytes(model.kv_layout, depth)
     if per_token <= 0 or bandwidth_gbs <= 0:
@@ -375,6 +378,11 @@ class Tuner:
                f"{rep.depth:,} tokens of chat"
         if empty:
             note += f", {empty[winner] / empty[loser] - 1:+.0%} in an empty one"
+            # The reported speed is for the settings that are saved (Granite MoE: 47.8 -> about 38).
+            rep.best_tps *= empty[winner] / empty[loser]
+            rep.verdict = verdict(rep.best_tps)
+        rep.notes = ["Apart from flash attention, llama.cpp's default settings are the fastest on this PC."
+                     if n.startswith("llama.cpp's default settings are already") else n for n in rep.notes]
         rep.notes.append(note + ".")
 
     def _run_stages(self, rep: TuneReport) -> None:
@@ -627,5 +635,5 @@ def _explain_error(result: SweepResult, build: int = 0) -> str:
         "memory_guard": "A test was stopped because free memory ran too low.",
         "memory_guard_external": "A test was stopped because another program used up free memory.",
         "timeout": "A test was stopped at the time limit; the results so far are used.",
-        "not_found": "llama-bench was not found: set LLAMA_CPP_DIR to the llama.cpp folder.",
+        "not_found": NOT_FOUND_ADVICE,
     }.get(result.error, f"A llama-bench run failed ({result.error}).")

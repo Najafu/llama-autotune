@@ -436,3 +436,25 @@ def test_best_bandwidth_ever_measured_is_used(sim, monkeypatch, tmp_path):
     tuner.known_bandwidth = 18.0
     rep = tuner.run()
     assert rep.bandwidth_gbs == 18.0 and rep.efficiency < 1.0
+
+
+def test_moe_prediction_reads_only_the_used_experts():
+    """An MoE token reads shared weights plus `used` of `count` experts, not every expert."""
+    from llama_autotune.tuner import predict_generation_tps
+    dense = ModelInfo(bytes_per_token=1000 * MIB, active_bytes_per_token=1000 * MIB)
+    # 200 MiB shared + 800 MiB of experts, 8 of 32 used -> 400 MiB read per token
+    moe = ModelInfo(bytes_per_token=1000 * MIB, active_bytes_per_token=400 * MIB, is_moe=True)
+    assert predict_generation_tps(moe, 18.0) == pytest.approx(2.5 * predict_generation_tps(dense, 18.0))
+    assert predict_generation_tps(ModelInfo(bytes_per_token=1000 * MIB), 18.0) == \
+        pytest.approx(predict_generation_tps(dense, 18.0))   # older records without the field
+
+
+def test_reported_speed_matches_the_saved_flash_attention(sim):
+    """Granite MoE: FA off was 20% slower empty, 120% faster after 2,048 tokens; report the saved setting."""
+    machine = SimMachine(lambda t, fa, rp: 47.8 * (1.0 if fa in (True, None) else 0.8),
+                         depth_factor=lambda fa: 0.30 if fa in (True, None) else 0.84)
+    rep = sim(machine).run()
+    assert rep.config.flash_attn is False
+    assert rep.best_tps == pytest.approx(47.8 * 0.8, rel=0.02)
+    assert not any(n.startswith("llama.cpp's default settings are already") for n in rep.notes)
+    assert any(n.startswith("Apart from flash attention") for n in rep.notes)

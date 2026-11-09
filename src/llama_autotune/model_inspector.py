@@ -481,8 +481,14 @@ def inspect_model(path: str | Path) -> ModelInfo:
 
     expert_count = _get_int(kv, f"{arch}.expert_count", default=0)
     info.is_moe = expert_count > 1
+    info.active_bytes_per_token = info.bytes_per_token
     if info.is_moe:
         used = _get_int(kv, f"{arch}.expert_used_count", default=0)
+        expert_bytes = sum(t.nbytes for t in gguf.tensors if "_exps" in t.name)
+        if expert_bytes and used:
+            # One token reads the shared weights and only `used` of `expert_count` experts.
+            info.active_bytes_per_token = (info.bytes_per_token - expert_bytes
+                                           + expert_bytes * min(used, expert_count) // expert_count)
         expert_elems = _expert_elements(gguf.tensors)
         if expert_elems and tensor_elems:
             info.active_parameters = tensor_elems - expert_elems + expert_elems * used // expert_count

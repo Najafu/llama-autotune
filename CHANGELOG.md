@@ -35,6 +35,23 @@ defaults, and answers in plain words.
   records, and results finished before a watchdog stop are kept.
 - NUMA node count in `doctor`. On multi-socket PCs, `tune` also tests
   `--numa distribute`.
+- `launch` passes your own llama-server options through, such as sampling
+  settings: `--temp 0.1 --top-k 50 --repeat-penalty 1.1`, or the names used on
+  model cards (`temperature=0.1 top_k=50 repetition_penalty=1.1`). They are
+  checked against the installed build (a typo gets a suggestion), replace the
+  matching generated option, and are remembered per model until
+  `--forget-settings`. The built-in web chat sends no sampling values of its
+  own, so these apply there.
+- `launch -c max`: the largest context that fits in the RAM free right now
+  (binary search in 1,024-token steps).
+- `setup <folder>` saves where llama.cpp is, so no environment variable is
+  needed. llama.cpp is also found in common unzip places (current folder,
+  `C:\llama`, the newest download), and every command explains how to get
+  it when it is missing.
+- MoE speed prediction: only the experts used per token are counted as read
+  (Granite 3.1 1B-A400M: 0.27 of 0.77 GB; predicted 53.9, measured 47.8
+  tokens/s). Before, every expert was counted, so MoE predictions were several
+  times too low.
 - Above-normal priority for `tune` measurements and for `launch`
   (`--prio 1 --prio-batch 1`): +13% and much steadier speed while other
   programs keep half the CPU busy. High priority gave nothing more.
@@ -103,6 +120,11 @@ Found earlier:
 
 ### Changed
 
+- `search` uses the same memory model as `tune` and `launch`, so its
+  `max_context` objective no longer picks contexts that only fit on paper
+  (flash attention off at long contexts was underestimated).
+- When flash attention off wins in a long chat but loses in an empty one, the
+  reported speed is that of the saved settings, not of the defaults.
 - `search` is now described as the advanced option for GPUs and experiments;
   `tune` is the default for CPUs.
 - Tests no longer touch the user's real database.

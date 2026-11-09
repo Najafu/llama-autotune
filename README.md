@@ -8,6 +8,7 @@ A cross-platform benchmarking and optimization tool for `llama.cpp` that automat
 - Any GGUF quantization
 
 ```bash
+llama-autotune setup C:\llama         # once: where you unzipped llama.cpp
 llama-autotune doctor                 # check this PC and the installed llama.cpp
 llama-autotune inspect model.gguf     # what the model needs and what fits right now
 llama-autotune tune model.gguf        # measure the fastest settings (up to 10 minutes, once)
@@ -29,50 +30,53 @@ llama-autotune launch model.gguf      # start llama-server with the tuned settin
 - **Advanced search** — heuristic baseline → local grid search → Bayesian (Optuna) tuning, for GPUs and experiments
 - **SQLite history and launch profiles** — results keyed by machine, model fingerprint and llama.cpp build
 
-## Installation
+## Getting started
 
-### Prerequisites
+Everything runs as commands in a terminal or PowerShell. There is no installer.
 
-- Python 3.12+
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) built binaries (`llama-bench.exe`, `llama-server.exe`)
-- `uv` (recommended) or `pip`
+**One-time setup (about 10 minutes):**
 
-### Option 1: Install from source (recommended)
+1. Install [uv](https://docs.astral.sh/uv/), which also takes care of Python:
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+2. Install llama-autotune:
+   ```bash
+   uv tool install git+https://github.com/Najafu/llama-autotune
+   ```
+3. Download llama.cpp from its [releases page](https://github.com/ggml-org/llama.cpp/releases). For a PC without a GPU, take the file ending in `bin-win-cpu-x64.zip`, and unzip it, for example to `C:\llama`.
+4. Tell llama-autotune where it is (once):
+   ```bash
+   llama-autotune setup C:\llama
+   ```
+5. Check everything:
+   ```bash
+   llama-autotune doctor
+   ```
+
+**For each model** (a `.gguf` file, for example from Hugging Face):
 
 ```bash
-git clone https://github.com/Najafu/llama-autotune.git
+llama-autotune inspect model.gguf   # optional: does it fit, and at which context sizes
+llama-autotune tune model.gguf      # once: measures the fastest settings, up to 10 minutes
+llama-autotune launch model.gguf    # every time: starts the chat at http://127.0.0.1:8080
+```
+
+Press Ctrl+C in the terminal to stop the chat. After a llama.cpp update, `launch` reminds you to run `tune` again.
+
+### Other ways to install
+
+```bash
+git clone https://github.com/Najafu/llama-autotune.git   # from source, for development
 cd llama-autotune
-uv sync
+uv sync                                                  # then: uv run llama-autotune ...
+
+pip install git+https://github.com/Najafu/llama-autotune.git   # with an existing Python 3.12+
 ```
 
-### Option 2: Install directly from GitHub
+### Where llama-autotune looks for llama.cpp
 
-```bash
-pip install git+https://github.com/Najafu/llama-autotune.git
-```
-
-### Setting up llama.cpp
-
-The tool needs the `llama-bench` and `llama-server` binaries (`llama-bench.exe` / `llama-server.exe` on Windows). It looks for them in this order:
-
-1. The directory set in the `LLAMA_CPP_DIR` environment variable
-2. Directories next to the installed package
-3. Your system `PATH`
-
-```bash
-# Linux / macOS
-export LLAMA_CPP_DIR=/path/to/llama.cpp/build/bin
-
-# Windows (PowerShell)
-$env:LLAMA_CPP_DIR = "C:\path\to\llamacpp"
-```
-
-### Verify installation
-
-```bash
-llama-autotune --version
-llama-autotune inspect path/to/model.gguf
-```
+In this order: the `LLAMA_CPP_DIR` environment variable, the folder saved by `llama-autotune setup`, folders next to the installed package, the system `PATH`, and finally common places where people unzip it (the current folder, `C:\llama`, `C:\llama.cpp`, and the newest `llama-b…-bin-…` folder in Downloads). When it is not found, every command says how to get it.
 
 ## Usage
 
@@ -185,7 +189,7 @@ llama-autotune search model.gguf --objective max_generation_tps --profile best.j
 | `max_efficiency` | Generation speed per MB of memory |
 | `balanced` | Generation speed (default) |
 
-MoE models (e.g. OLMoE, Qwen-MoE, DeepSeek, Mixtral) are fully supported — the inspector automatically detects `expert_count` and `expert_used_count` from GGUF headers and reports active vs total parameters.
+MoE models (e.g. Granite MoE, OLMoE, Qwen-MoE, DeepSeek, Mixtral) are supported: the inspector reads `expert_count` and `expert_used_count`, reports active vs total parameters, counts every expert for memory and only the experts used per token for the speed prediction. Tested with Granite 3.1 1B-A400M (32 experts, 8 used): 0.27 GB read per token of a 0.77 GB file, predicted 53.9 and measured 47.8 tokens/s, memory estimate 43 MiB above the real working set.
 
 ### launch
 
@@ -197,11 +201,25 @@ llama-autotune launch model.gguf -c 8192 --images # longer context, keep the vis
 llama-autotune launch model.gguf --dry-run        # print the command only
 llama-autotune launch model.gguf --editing        # faster when rewriting text you paste in
 llama-autotune launch model.gguf --profile best.json
+llama-autotune launch model.gguf -c max           # the largest context that fits in free RAM now
 ```
 
 After `tune`, `launch` uses the measured settings for that model automatically. If llama.cpp has been upgraded since, it says so and suggests running `tune` again.
 
 `--editing` turns on llama.cpp's n-gram speculative decoding (`--spec-type ngram-mod`). It speeds up answers that repeat text from the prompt, such as fixing or rewriting a pasted document: 1.7 to 2.6 times faster in testing. On brand-new text it is about 7% slower, so it is off by default.
+
+**Your own llama-server options**, such as sampling settings, can follow the model. Both llama.cpp spellings and the names used on model cards work, and they are remembered for that model until you change or forget them:
+
+```bash
+llama-autotune launch model.gguf --temp 0.1 --top-k 50 --repeat-penalty 1.1
+llama-autotune launch model.gguf temperature=0.1 top_k=50 repetition_penalty=1.1   # same thing
+llama-autotune launch model.gguf                   # uses the remembered options again
+llama-autotune launch model.gguf --forget-settings
+```
+
+Each option is checked against the installed llama.cpp first, so a typo gets a suggestion (`--topk` → "Did you mean --top-k?"). An option you give replaces the one llama-autotune would have set (for example `-t`). Options that change memory use, such as `-c` or `-ub`, are not covered by the memory plan, and `launch` says so. These options become the server's defaults: the built-in web chat sends no sampling values of its own (checked on b12228), so they apply there; another chat app may send its own values per message.
+
+`-c max` searches, in steps of 1,024 tokens, for the largest context that fits in the RAM free right now, applying the memory savings below as needed. Expect it to be slower than the default.
 
 When the model does not fit, `launch` refuses with the exact shortfall instead of letting Windows swap. To make it fit, it first shrinks the batch (no speed cost), then turns weight repacking off, then compresses the KV cache, and only then shortens the context. Profiles remember the llama.cpp build they were tuned on and warn after an upgrade.
 
@@ -218,7 +236,7 @@ llama-autotune import profile.json
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLAMA_CPP_DIR` | parent of tool directory | Path to the `llama-bench` / `llama-server` binaries |
+| `LLAMA_CPP_DIR` | not set | Path to the `llama-bench` / `llama-server` binaries; overrides `llama-autotune setup` |
 
 ## Data Storage
 
@@ -229,7 +247,7 @@ Benchmark history and launch profiles are stored in a SQLite database at:
 C:\Users\<you>\.llama-autotune\benchmarks.db   # Windows
 ```
 
-Delete this file at any time to reset the benchmark history — it is recreated automatically.
+Delete this file at any time to reset the benchmark history — it is recreated automatically. The same folder holds `config.json` (the llama.cpp folder saved by `setup`) and a cache of what each llama.cpp build supports.
 
 ## Dependencies
 
@@ -252,6 +270,7 @@ src/llama_autotune/
 ├── model_inspector.py  # GGUF reader: metadata, tensor table, KV geometry, real quantization
 ├── memory.py           # Memory model: weights, KV cache, repack copy, compute buffers
 ├── constraints.py      # Memory gate (free RAM, safety margin, savings) + OOM detection
+├── extra_args.py       # Your llama-server options for launch: names, checks, remembering
 ├── resources.py        # Free RAM, commit, power, CPU topology, bandwidth (Win32 + psutil)
 ├── hardware.py         # Hardware summary; llama.cpp devices are the authority
 ├── tuner.py            # Measured CPU tuning: predict, calibrate, screen, confirm, verdict
@@ -274,19 +293,16 @@ GGUF inspector       ┘          (bandwidth)   (calibrate)  (one llama-bench pr
 
 ## Troubleshooting
 
-### "llama-bench not found"
+### "llama.cpp was not found"
 
-The most common issue. Set `LLAMA_CPP_DIR` to the directory containing the llama.cpp binaries and verify:
+Download and unzip llama.cpp (see [Getting started](#getting-started)), then tell llama-autotune where it is:
 
 ```bash
-# Windows (PowerShell)
-$env:LLAMA_CPP_DIR = "C:\path\to\llamacpp"
-
-# Linux / macOS
-export LLAMA_CPP_DIR=/path/to/llama.cpp/build/bin
-
-llama-autotune benchmark model.gguf -r 1
+llama-autotune setup C:\llama
+llama-autotune doctor
 ```
+
+`setup` also finds the programs in a subfolder of the folder you give. If `LLAMA_CPP_DIR` is set, it wins over `setup`.
 
 On Linux/macOS make sure the binaries are executable (`chmod +x llama-bench`).
 

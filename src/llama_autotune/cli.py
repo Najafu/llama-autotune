@@ -9,6 +9,7 @@ compatibility layer.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -23,14 +24,19 @@ from rich.console import Console
 from rich.table import Table
 
 from .benchmark import run_benchmark
+from .extra_args import ExtraArgsError, apply_over, describe, merge, parse_extra_args, setting_key
 from .compat import (
+    NOT_FOUND_ADVICE, binary_name, llama_found, save_llama_dir, saved_llama_dir,
     Capabilities, architecture_supported, clean_env, config_ini_paths, detect_capabilities,
     llama_env_overrides, render_args, update_llama_advice,
 )
 from .constraints import GateDecision, memory_budget, plan_memory, safety_margin
 from datetime import datetime, timezone
 
-from .database import TunedSettings, best_bandwidth, get_session, get_tuned, save_benchmark, save_tuned
+from .database import (
+    TunedSettings, best_bandwidth, get_model_args, get_session, get_tuned, save_benchmark, save_model_args,
+    save_tuned,
+)
 from .hardware import detect_hardware, hardware_fingerprint
 from .heuristics import apply_launch_defaults, generate_initial_config
 from .memory import MIB, compute_model_for, estimate_memory, kv_cache_bytes, tensor_sizes_of
@@ -67,6 +73,13 @@ _FLAG = re.compile(r"^-{1,2}[A-Za-z]")
 def _require_model_file(path: str) -> None:
     if not os.path.isfile(path):
         console.print(f"[red]Error: model file not found: {path}[/red]")
+        raise typer.Exit(code=1)
+
+
+def _require_llama(caps: Capabilities) -> None:
+    """Stop with plain setup advice when llama.cpp cannot be found."""
+    if not (llama_found(caps.server_path) and llama_found(caps.bench_path)):
+        console.print(f"[red]{NOT_FOUND_ADVICE}[/red]")
         raise typer.Exit(code=1)
 
 
@@ -124,7 +137,7 @@ def _model_table(m: ModelInfo) -> Table:
     table.add_row("Context Length", f"{m.training_context:,}")
     table.add_row("MoE", "Yes" if m.is_moe else "No")
     table.add_row("File Size", f"{m.file_size_gb} GB")
-    table.add_row("Read per token", f"{m.bytes_per_token / 1e9:.2f} GB")
+    table.add_row("Read per token", f"{(m.active_bytes_per_token or m.bytes_per_token) / 1e9:.2f} GB")
     if m.kv_layout is not None:
         table.add_row("KV cache", f"{_mib(kv_cache_bytes(m.kv_layout, 1024))} per 1,024 tokens (f16)")
     return table
@@ -161,6 +174,32 @@ def _memory_plan_table(model: ModelInfo, hw: HardwareInfo, mem: MemoryStatus, si
     return table
 
 
+@app.command(help="Tell llama-autotune where llama.cpp is: the folder you unzipped it to.")
+def setup(
+    folder: str = typer.Argument(..., help="Folder that contains llama-server and llama-bench"),
+):
+    """Save the llama.cpp folder so no environment variable is needed."""
+    root = Path(folder).expanduser()
+    if not root.is_dir():
+        console.print(f"[red]Folder not found: {root}[/red]")
+        raise typer.Exit(code=1)
+    server = binary_name("llama-server")
+    found = root if (root / server).is_file() else next(
+        (p.parent for p in sorted(root.glob(f"**/{server}"), key=lambda p: len(p.parts))), None)
+    if found is None or not (found / binary_name("llama-bench")).is_file():
+        console.print(f"[red]No {server} and {binary_name('llama-bench')} in {root} or its subfolders.[/red] "
+                      "Unzip the llama.cpp release there first.")
+        raise typer.Exit(code=1)
+    save_llama_dir(str(found))
+    env = os.environ.get("LLAMA_CPP_DIR")
+    if env and Path(env).resolve() != found.resolve():
+        console.print(f"[yellow]LLAMA_CPP_DIR is set to {env} and takes precedence. Remove it, or run "
+                      f"setx LLAMA_CPP_DIR \"{found}\" and open a new terminal.[/yellow]")
+    caps = detect_capabilities()
+    build = f"b{caps.build.build_number}" if caps.build.build_number else "unknown build"
+    console.print(f"[green]Saved.[/green] llama.cpp {build} in {found}. Next: llama-autotune doctor")
+
+
 @app.command(help="Check this PC and the installed llama.cpp build.")
 def doctor(
     bandwidth: bool = typer.Option(True, "--bandwidth/--no-bandwidth", help="Measure memory bandwidth (about 1 s)"),
@@ -189,7 +228,7 @@ def doctor(
     if caps.build.build_number:
         llama.add_row("Build", f"b{caps.build.build_number} ({caps.build.version}, commit {caps.build.commit})")
     else:
-        llama.add_row("Build", "[red]not found: set LLAMA_CPP_DIR to the folder with llama-server[/red]")
+        llama.add_row("Build", "[red]not found[/red]")
     llama.add_row("Devices", ", ".join(f"{d.name} {d.description} ({d.total_mib} MiB)" for d in caps.devices)
                   or "CPU only")
     if caps.server:
@@ -198,6 +237,8 @@ def doctor(
         llama.add_row("Features", ", ".join(f"{name} {'yes' if caps.server.has(flag) else 'no'}"
                                             for flag, name in checks.items()))
     console.print(llama)
+    if not llama_found(caps.server_path):
+        console.print(f"[red]{NOT_FOUND_ADVICE}[/red]")
 
     warnings = []
     for key, value in llama_env_overrides().items():
@@ -308,6 +349,7 @@ def tune(
     """Measure llama.cpp's defaults and better settings, then save the winner for ``launch``."""
     _require_model_file(model)
     caps = detect_capabilities()
+    _require_llama(caps)
     hw = detect_hardware(caps)
     if hw.backend != Backend.CPU:
         console.print("[yellow]tune measures CPU settings. GPU tuning comes in a later version; "
@@ -392,6 +434,7 @@ def benchmark(
     """Run one benchmark, guarded by the RAM watchdog."""
     _require_model_file(model)
     caps = detect_capabilities()
+    _require_llama(caps)
     hw = detect_hardware(caps)
     model_info = inspect_model(model)
     if not _loadable(caps, model_info):
@@ -453,6 +496,7 @@ def search(
         raise typer.Exit(code=1)
 
     opt = Optimizer(model_path=model, objective=obj, n_trials_stage_b=trials_b, n_trials_stage_c=trials_c)
+    _require_llama(opt.caps)
     if not _loadable(opt.caps, opt.model):
         raise typer.Exit(code=1)
     mem = memory_status()
@@ -496,6 +540,30 @@ def search(
         conn.close()
 
 
+# Extra options that change memory use; the plan does not see them.
+_MEMORY_FLAGS = {"-c", "-b", "-ub", "-ctk", "-ctv", "-fa", "--repack", "-np", "-cram", "-ngl", "--mlock"}
+
+
+def _largest_fitting_context(plan, limit: int) -> GateDecision:
+    """Binary search, in steps of 1,024 tokens, for the largest context the gate accepts."""
+    best = plan(ctx=2048, min_ctx=2048)
+    if not best.fits:
+        return best
+    lo, hi = 2, max(2, limit // 1024)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        gate = plan(ctx=mid * 1024, min_ctx=mid * 1024)
+        if gate.fits and gate.ctx == mid * 1024:
+            lo, best = mid, gate
+        else:
+            hi = mid - 1
+    if limit % 1024 and limit > lo * 1024:
+        gate = plan(ctx=limit, min_ctx=limit)
+        if gate.fits:
+            best = gate
+    return best
+
+
 def _print_gate(gate: GateDecision, mem: MemoryStatus) -> None:
     need, spare = _mib(gate.estimate.total), _mib(safety_margin(mem.total))
     if gate.fits:
@@ -510,23 +578,59 @@ def _print_gate(gate: GateDecision, mem: MemoryStatus) -> None:
         console.print("  Close other programs to free memory, or choose a smaller model or quantization.")
 
 
-@app.command(help="Start llama-server with a configuration that fits in free RAM.")
+@app.command(
+    help="Start llama-server with a configuration that fits in free RAM. Any llama-server option can follow "
+         "the model, e.g. --temp 0.1 --top-k 50 --repeat-penalty 1.1 (or temperature=0.1); "
+         "they are remembered for this model.",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 def launch(
+    extra: typer.Context,
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Path to profile JSON"),
-    ctx: int = typer.Option(4096, "-c", "--ctx-size", help="Wanted context size (reduced if it does not fit)"),
+    ctx: str = typer.Option("4096", "-c", "--ctx-size",
+                            help="Wanted context size (reduced if it does not fit), or 'max' for the largest "
+                                 "that fits in free RAM now"),
     images: bool = typer.Option(False, "--images", help="Keep the vision projector loaded"),
     editing: bool = typer.Option(False, "--editing",
                                  help="Faster when rewriting or editing text you paste in (speculative decoding)"),
     host: str = typer.Option("127.0.0.1", "--host", help="Server host"),
     port: int = typer.Option(8080, "--port", help="Server port"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the command without starting the server"),
+    forget_settings: bool = typer.Option(False, "--forget-settings",
+                                         help="Forget the extra options remembered for this model"),
 ):
-    """Plan memory, apply safe defaults and start llama-server."""
+    """Plan memory, apply safe defaults, add the user's options and start llama-server."""
     _require_model_file(model)
     caps = detect_capabilities()
-    if not _loadable(caps, inspect_model(model)):
+    _require_llama(caps)
+    model_info = inspect_model(model)
+    if not _loadable(caps, model_info):
         raise typer.Exit(code=1)
+    want_max = ctx.strip().lower() == "max"
+    if not want_max and not ctx.isdigit():
+        console.print(f"[red]Context must be a number of tokens or 'max', not '{ctx}'.[/red]")
+        raise typer.Exit(code=1)
+    try:
+        new_pairs = parse_extra_args(list(extra.args), caps.server)
+    except ExtraArgsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
+    conn = get_session()
+    saved = [] if forget_settings else get_model_args(conn, model_info.fingerprint)
+    pairs = merge(saved, new_pairs, caps.server)
+    if forget_settings or new_pairs:
+        save_model_args(conn, model_info.fingerprint, pairs, model)
+    conn.close()
+    if forget_settings:
+        console.print("Forgot the extra options remembered for this model.")
+    if pairs:
+        label = "Your options" if new_pairs else "Your remembered options"
+        console.print(f"{label} for this model: {describe(pairs)}")
+        unchecked = [f for f, _ in pairs if setting_key(f, caps.server) in _MEMORY_FLAGS]
+        if unchecked:
+            console.print(f"[yellow]Not covered by the memory plan: {' '.join(unchecked)}. If the PC slows "
+                          f"down, run launch with --forget-settings.[/yellow]")
     if profile:
         if not os.path.isfile(profile):
             console.print(f"[red]Error: profile file not found: {profile}[/red]")
@@ -542,24 +646,31 @@ def launch(
             raise typer.Exit(code=1)
     else:
         hw = detect_hardware(caps)
-        model_info = inspect_model(model)
-        if model_info.training_context:
-            ctx = min(ctx, model_info.training_context)
+        limit = model_info.training_context or 131072
+        want = limit if want_max else min(int(ctx), limit)
         config = _apply_tuned(generate_initial_config(hw, model_info), hw, model_info,
                               caps.build.build_number)
         if hw.backend == Backend.CPU:
             mem = memory_status()
-            gate = plan_memory(model_info, memory_budget(mem.available, mem.total),
-                               isa_tier=hw.isa_tier or "avx2", ctx=ctx, min_ctx=min(2048, ctx),
-                               ubatch=config.ubatch_size or 512, tensor_sizes=tensor_sizes_of(model),
-                               compute_model=compute_model_for(model, model_info, caps.build.build_number),
-                               flash_attn=config.flash_attn)
+            plan = functools.partial(
+                plan_memory, model_info, memory_budget(mem.available, mem.total),
+                isa_tier=hw.isa_tier or "avx2", ubatch=config.ubatch_size or 512,
+                tensor_sizes=tensor_sizes_of(model),
+                compute_model=compute_model_for(model, model_info, caps.build.build_number),
+                flash_attn=config.flash_attn)
+            gate = _largest_fitting_context(plan, limit) if want_max else plan(ctx=want, min_ctx=min(2048, want))
+            if want_max and gate.fits:
+                console.print(f"Largest context that fits now: {gate.ctx:,} tokens "
+                              f"(the model supports {limit:,}).")
             _print_gate(gate, mem)
             if not gate.fits:
                 raise typer.Exit(code=1)
             config = gate.apply(config)
         else:
-            config.ctx_size = ctx
+            if want_max:
+                console.print("[yellow]-c max plans system RAM only; on a GPU the model's full context is "
+                              "requested and llama.cpp fits it to the GPU.[/yellow]")
+            config.ctx_size = want
         config = apply_launch_defaults(config, hw, model_info, want_images=images)
         if editing:
             if caps.server is not None and not caps.server.has("--spec-type"):
@@ -571,6 +682,9 @@ def launch(
             console.print(f"[yellow]Skipped {s}[/yellow]")
         args = rendered.args
 
+    args, replaced = apply_over(args, pairs, caps.server)
+    if replaced:
+        console.print(f"[dim]Your options replace: {' '.join(replaced)}[/dim]")
     cmd = [caps.server_path, "-m", model, "--host", host, "--port", str(port), *args]
     console.print("[bold]Starting llama-server:[/bold]" if not dry_run else "[bold]Command:[/bold]")
     console.print(f"  {subprocess.list2cmdline(cmd)}")

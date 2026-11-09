@@ -219,7 +219,7 @@ def is_oom(config: SearchConfig, model: ModelInfo, hw: HardwareInfo) -> bool:
 
 def is_plausible(config: SearchConfig, model: ModelInfo, hw: HardwareInfo, *,
                  budget: int | None = None, tensor_sizes: dict[str, tuple[str, int]] | None = None,
-                 compute_override: int | None = None) -> bool:
+                 compute_override: int | None = None, compute_model: ComputeModel | None = None) -> bool:
     """Determine whether a configuration is worth benchmarking.
 
     Rejects configurations that do not fit in memory, request more threads
@@ -230,9 +230,11 @@ def is_plausible(config: SearchConfig, model: ModelInfo, hw: HardwareInfo, *,
     """
     if budget is not None:
         cache = config.cache_type_v or "f16"
-        est = estimate_config_memory(model, config.ctx_size or 4096, cache, config.ubatch_size or 512,
-                                     config.repack is not False, hw.isa_tier or "avx2",
-                                     tensor_sizes, compute_override)
+        ctx, ub = config.ctx_size or 4096, config.ubatch_size or 512
+        fa = True if cache not in ("f16", "f32", "bf16") else config.flash_attn
+        est = estimate_config_memory(model, ctx, cache, ub, config.repack is not False, hw.isa_tier or "avx2",
+                                     tensor_sizes, compute_override,
+                                     compute_bytes=compute_model.bytes(ctx, ub, fa) if compute_model else None)
         if est.total > budget:
             return False
     elif is_oom(config, model, hw):

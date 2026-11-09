@@ -23,7 +23,7 @@ from .compat import detect_capabilities
 from .constraints import GateDecision, detect_oom_in_output, is_plausible, memory_budget, plan_memory
 from .hardware import detect_hardware
 from .heuristics import generate_initial_config, to_cpu_config
-from .memory import compute_buffer_for, tensor_sizes_of
+from .memory import compute_model_for, tensor_sizes_of
 from .model_inspector import inspect_model
 from .resources import memory_status
 from .models import (
@@ -90,7 +90,8 @@ class Optimizer:
             self._memory_check = {
                 "budget": memory_budget(mem.available, mem.total),
                 "tensor_sizes": tensor_sizes_of(model_path),
-                "compute_override": compute_buffer_for(model_path, ctx),
+                # llama-bench keeps logits for every token: the larger, safe figure.
+                "compute_model": compute_model_for(model_path, self.model),
             }
             self.gate = plan_memory(
                 self.model, isa_tier=self.hw.isa_tier or "avx2", ctx=ctx,

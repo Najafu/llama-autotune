@@ -120,6 +120,9 @@ class ModelInfo(BaseModel):
     vocab_size: int = 0
     tensor_bytes: int = 0
     bytes_per_token: int = 0
+    # MoE: what one token really reads (shared weights + the experts it uses);
+    # equals bytes_per_token for dense models. All experts stay in memory.
+    active_bytes_per_token: int = 0
     tensor_types: dict[str, int] = {}
     kv_layout: KVLayout | None = None
     fingerprint: str = ""

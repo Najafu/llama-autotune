@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .models import BenchmarkEntry, LaunchProfile, SearchConfig
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS benchmarks (
@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS tuned_settings (
     bandwidth_gbs REAL,
     model_path TEXT,
     timestamp TEXT
+);
+CREATE TABLE IF NOT EXISTS model_settings (
+    model_id TEXT PRIMARY KEY,
+    args_json TEXT,
+    model_path TEXT,
+    updated TEXT
 );
 """
 
@@ -232,3 +238,24 @@ def get_tuned(conn: sqlite3.Connection, hardware_id: str, model_id: str) -> Tune
         bandwidth_gbs=row["bandwidth_gbs"] or 0.0, model_path=row["model_path"] or "",
         timestamp=row["timestamp"] or "",
     )
+
+
+# ── llama-server options the user set for a model (launch --temp 0.1 ...) ──
+
+
+def get_model_args(conn: sqlite3.Connection, model_id: str) -> list[tuple[str, str | None]]:
+    """The extra options remembered for this model file, as ``(flag, value)`` pairs."""
+    row = conn.execute("SELECT args_json FROM model_settings WHERE model_id = ?", (model_id,)).fetchone()
+    return [(f, v) for f, v in json.loads(row["args_json"])] if row else []
+
+
+def save_model_args(conn: sqlite3.Connection, model_id: str, pairs: list[tuple[str, str | None]],
+                    model_path: str = "") -> None:
+    """Remember extra options for this model file; an empty list forgets them."""
+    if pairs:
+        conn.execute("INSERT OR REPLACE INTO model_settings (model_id, args_json, model_path, updated) "
+                     "VALUES (?, ?, ?, ?)",
+                     (model_id, json.dumps(pairs), model_path, datetime.now(timezone.utc).isoformat()))
+    else:
+        conn.execute("DELETE FROM model_settings WHERE model_id = ?", (model_id,))
+    conn.commit()
