@@ -41,6 +41,7 @@ def detect_hardware(caps: Capabilities | None = None, probe_llama: bool = True) 
     info.performance_cores = topo.performance_cores
     info.efficiency_cores = topo.efficiency_cores
     info.performance_threads = topo.performance_logical
+    info.numa_nodes = topo.numa_nodes or 1
     mem = memory_status()
     info.ram_gb = round(mem.total / GIB, 1)
     info.ram_available_gb = round(mem.available / GIB, 2)

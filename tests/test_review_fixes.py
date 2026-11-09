@@ -23,7 +23,7 @@ def test_hybrid_cpu_searches_performance_core_hyperthreads():
     hw = HardwareInfo(physical_cores=12, logical_cores=20, performance_cores=8, efficiency_cores=4,
                       performance_threads=16, backend=Backend.CPU)
     threads = get_search_space(hw, _model(), OptimizeObjective.BALANCED)["threads"]
-    assert (threads.low, threads.high) == (7, 16)
+    assert (threads.low, threads.high) == (2, 16)  # many cores: start at a quarter of them
 
 
 def test_gate_keeps_the_heuristic_ubatch():

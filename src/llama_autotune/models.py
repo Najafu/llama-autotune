@@ -71,6 +71,7 @@ class HardwareInfo(BaseModel):
     performance_cores: int = 0
     efficiency_cores: int = 0
     performance_threads: int = 0
+    numa_nodes: int = 1
     ram_gb: float = 0.0
     ram_available_gb: float = 0.0
     gpu_count: int = 0
@@ -119,6 +120,9 @@ class ModelInfo(BaseModel):
     vocab_size: int = 0
     tensor_bytes: int = 0
     bytes_per_token: int = 0
+    # MoE: what one token really reads (shared weights + the experts it uses);
+    # equals bytes_per_token for dense models. All experts stay in memory.
+    active_bytes_per_token: int = 0
     tensor_types: dict[str, int] = {}
     kv_layout: KVLayout | None = None
     fingerprint: str = ""
@@ -181,6 +185,8 @@ class SearchConfig(BaseModel):
     ctx_checkpoints: int | None = None
     no_mmproj: bool | None = None
     spec_type: str | None = None
+    priority: int | None = None  # --prio: 0 normal, 1 above normal, 2 high
+    mmproj: str | None = None  # vision file for llama-server (--mmproj)
 
     def to_bench_args(self) -> list[str]:
         """Render as ``llama-bench`` arguments using current llama.cpp flags.

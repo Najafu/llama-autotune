@@ -416,6 +416,11 @@ def kv_layout(kv: dict, arch: str) -> KVLayout:
         n_group = _get_int(kv, f"{arch}.ssm.group_count", 0)
         per_layer = 4 * (d_inner * d_state + (d_conv - 1) * (d_inner + 2 * n_group * d_state))
         layout.recurrent_bytes = recurrent_layers * per_layer
+    l_cache = _get_int(kv, f"{arch}.shortconv.l_cache", 0)
+    if recurrent_layers and l_cache > 1 and not layout.recurrent_bytes:
+        # LFM2/LFM3 short-convolution layers keep (l_cache - 1) f32 columns of
+        # n_embd each (0.61 MiB for LFM3 1.7B, as llama.cpp b12228 reports).
+        layout.recurrent_bytes = recurrent_layers * 4 * (l_cache - 1) * n_embd
     return layout
 
 
@@ -476,8 +481,14 @@ def inspect_model(path: str | Path) -> ModelInfo:
 
     expert_count = _get_int(kv, f"{arch}.expert_count", default=0)
     info.is_moe = expert_count > 1
+    info.active_bytes_per_token = info.bytes_per_token
     if info.is_moe:
         used = _get_int(kv, f"{arch}.expert_used_count", default=0)
+        expert_bytes = sum(t.nbytes for t in gguf.tensors if "_exps" in t.name)
+        if expert_bytes and used:
+            # One token reads the shared weights and only `used` of `expert_count` experts.
+            info.active_bytes_per_token = (info.bytes_per_token - expert_bytes
+                                           + expert_bytes * min(used, expert_count) // expert_count)
         expert_elems = _expert_elements(gguf.tensors)
         if expert_elems and tensor_elems:
             info.active_parameters = tensor_elems - expert_elems + expert_elems * used // expert_count

@@ -2,6 +2,8 @@
 
 import pytest
 
+from llama_autotune.memory import ComputeModel
+
 import llama_autotune.optimizer as opt_mod
 from llama_autotune.compat import Capabilities, parse_help
 from llama_autotune.models import Backend, BenchmarkResult, HardwareInfo, KVLayout, ModelInfo
@@ -34,7 +36,8 @@ def simulated(monkeypatch, tmp_path):
     monkeypatch.setattr(opt_mod, "detect_hardware", lambda c=None: hw)
     monkeypatch.setattr(opt_mod, "inspect_model", lambda p: model)
     monkeypatch.setattr(opt_mod, "tensor_sizes_of", lambda p: None)
-    monkeypatch.setattr(opt_mod, "compute_buffer_for", lambda p, c: 258 * MIB)
+    monkeypatch.setattr(opt_mod, "compute_model_for",
+                        lambda p, m, server_build=0: ComputeModel(258 * MIB, 128256, 2048, 32))
     monkeypatch.setattr(opt_mod, "run_benchmark", fake_bench)
     return calls, caps, monkeypatch
 

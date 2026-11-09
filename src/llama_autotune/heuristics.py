@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from .models import Backend, HardwareInfo, ModelInfo, SearchConfig, SplitMode
 
+#: llama.cpp --prio level used on CPUs (1 = above normal; measured in experiment E3).
+ABOVE_NORMAL = 1
+
 
 def generate_initial_config(hw: HardwareInfo, model: ModelInfo) -> SearchConfig:
     """Create a reasonable starting SearchConfig for the given hardware and model.
@@ -101,7 +104,10 @@ def apply_launch_defaults(config: SearchConfig, hw: HardwareInfo, model: ModelIn
     * one slot (``-np 1``) for a single user,
     * the RAM prompt cache off on 8 GB machines and capped at 16 GB,
     * few context checkpoints for sliding-window and hybrid models,
-    * no vision projector unless images are wanted.
+    * no vision projector unless images are wanted,
+    * above-normal priority on the CPU: +13% and far steadier speed while
+      other programs keep half the CPU busy, with no gain from "high"
+      (experiment E3 on the test i3).
 
     Args:
         config: Configuration to extend (its context should already be set).
@@ -126,6 +132,8 @@ def apply_launch_defaults(config: SearchConfig, hw: HardwareInfo, model: ModelIn
         cfg.ctx_checkpoints = 2
     if not want_images and cfg.no_mmproj is None:
         cfg.no_mmproj = True
+    if cfg.priority is None and hw.backend == Backend.CPU:
+        cfg.priority = ABOVE_NORMAL
     return cfg
 
 
