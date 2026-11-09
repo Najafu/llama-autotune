@@ -197,7 +197,7 @@ Start `llama-server` with settings that fit in the memory free right now, then o
 
 ```bash
 llama-autotune launch model.gguf                  # 4,096-token context, reduced if needed
-llama-autotune launch model.gguf -c 8192 --images # longer context, keep the vision projector
+llama-autotune launch model.gguf -c 8192 --images # longer context, and read images if they fit
 llama-autotune launch model.gguf --dry-run        # print the command only
 llama-autotune launch model.gguf --editing        # faster when rewriting text you paste in
 llama-autotune launch model.gguf --profile best.json
@@ -221,7 +221,42 @@ Each option is checked against the installed llama.cpp first, so a typo gets a s
 
 `-c max` searches, in steps of 1,024 tokens, for the largest context that fits in the RAM free right now, applying the memory savings below as needed. Expect it to be slower than the default.
 
+**Images are optional.** A vision model comes with a second file, the vision projector (`mmproj-*.gguf`). `launch --images` finds the one that belongs to the model in the same folder, by its metadata rather than its name: its output width must equal the model's embedding width, so the 2B, 4B and 9B projectors in one folder never get mixed up. `--mmproj file.gguf` names one explicitly. The vision file and the work of reading one image are part of the memory plan: about the file size plus half again; the Qwen3.5 2B projector (637 MiB) needed 912 MiB in testing. If the model fits at the wanted context only without images, `launch` leaves images out, says so, and starts the text chat. With `-c max` it reports the largest context with and without images. Reading an image is slow on a CPU: a 1280x960 screenshot took 94 seconds and 1,221 tokens of context on the test PC, so smaller images help (see the next section).
+
 When the model does not fit, `launch` refuses with the exact shortfall instead of letting Windows swap. To make it fit, it first shrinks the batch (no speed cost), then turns weight repacking off, then compresses the KV cache, and only then shortens the context. Profiles remember the llama.cpp build they were tuned on and warn after an upgrade.
+
+### Using it from a coding agent or another app
+
+`launch` starts an OpenAI-compatible server and prints what an app needs: the base URL (`http://127.0.0.1:8080/v1`), the model name (the file name without `.gguf`, set with llama-server's `--alias`), and the context size. Tool calling works out of the box (llama-server uses the model's own chat template).
+
+For opencode, add a provider to `opencode.json` (in the project folder, or `~/.config/opencode/opencode.json`). The field names below follow opencode's documentation for OpenAI-compatible servers at the time of writing; check its [providers page](https://opencode.ai/docs/providers/) if your version differs:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local/qwen",
+  "providers": {
+    "local": {
+      "name": "llama-autotune",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen": {
+          "modelID": "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M",
+          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
+          "limit": { "context": 20480, "output": 4096 }
+        }
+      }
+    }
+  }
+}
+```
+
+- **`limit.context`:** set it to the context `launch` printed. Without it, opencode assumes 200,000 tokens and sends more than the server holds.
+- **Images:** add `"image"` to `input` only when `launch` says images are on. opencode's `media.image` settings can shrink screenshots, which makes them much faster to read on a CPU.
+- **Sampling settings** (temperature, top_p and so on): give them to `launch`, which makes them the server's defaults.
+
+Expect the first request to be slow on a CPU. A coding agent sends thousands of tokens of instructions and tool descriptions first: Qwen3.5 4B on the test PC read prompts at about 16 tokens/s, so 10,000 tokens take about 10 minutes. Later requests are quick, because llama-server reuses what it has already read. A smaller model reads prompts several times faster; `tune` shows the prompt speed.
 
 ### export / import
 
@@ -271,6 +306,7 @@ src/llama_autotune/
 ├── memory.py           # Memory model: weights, KV cache, repack copy, compute buffers
 ├── constraints.py      # Memory gate (free RAM, safety margin, savings) + OOM detection
 ├── extra_args.py       # Your llama-server options for launch: names, checks, remembering
+├── vision.py           # Vision files (mmproj): matching by width, memory
 ├── resources.py        # Free RAM, commit, power, CPU topology, bandwidth (Win32 + psutil)
 ├── hardware.py         # Hardware summary; llama.cpp devices are the authority
 ├── tuner.py            # Measured CPU tuning: predict, calibrate, screen, confirm, verdict

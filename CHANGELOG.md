@@ -42,6 +42,17 @@ defaults, and answers in plain words.
   matching generated option, and are remembered per model until
   `--forget-settings`. The built-in web chat sends no sampling values of its
   own, so these apply there.
+- Images with vision models: `launch --images` finds the vision file
+  (`mmproj-*.gguf`) that belongs to the model by its metadata (projection width
+  equals the model's embedding width), passes it with `--mmproj`, and counts it
+  in the memory plan (file size plus half again; 912 MiB measured for a 637 MiB
+  projector). Before, `--images` never told llama-server where the file was, so
+  images were rejected. Images are optional: when they do not fit at the wanted
+  context they are left out with a message and the text chat starts. `--mmproj`
+  names a file explicitly; `inspect` shows the vision file and its cost.
+- `launch` names the model with `--alias` (the file name without `.gguf`) and
+  prints the base URL, model name and context an app such as a coding agent
+  needs. The README shows an opencode configuration.
 - `launch -c max`: the largest context that fits in the RAM free right now
   (binary search in 1,024-token steps).
 - `setup <folder>` saves where llama.cpp is, so no environment variable is

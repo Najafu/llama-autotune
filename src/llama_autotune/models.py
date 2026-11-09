@@ -186,6 +186,7 @@ class SearchConfig(BaseModel):
     no_mmproj: bool | None = None
     spec_type: str | None = None
     priority: int | None = None  # --prio: 0 normal, 1 above normal, 2 high
+    mmproj: str | None = None  # vision file for llama-server (--mmproj)
 
     def to_bench_args(self) -> list[str]:
         """Render as ``llama-bench`` arguments using current llama.cpp flags.

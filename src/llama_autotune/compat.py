@@ -578,6 +578,7 @@ _SPELLINGS: dict[str, dict[str, list[_Emit]]] = {
         "no_mmproj": [_switch("--no-mmproj")],
         "spec_type": [_value("--spec-type")],
         "priority": [_priority_server],
+        "mmproj": [_value("--mmproj"), _value("-mm")],
     },
     "bench": {
         "threads": [_value("-t")],
@@ -602,7 +603,7 @@ _SPELLINGS: dict[str, dict[str, list[_Emit]]] = {
 
 # Settings that have no meaning for a tool (not an incompatibility).
 _NOT_APPLICABLE = {
-    "bench": {"ctx_size", "parallel", "cache_ram_mib", "ctx_checkpoints", "no_mmproj", "spec_type",
+    "bench": {"ctx_size", "parallel", "cache_ram_mib", "ctx_checkpoints", "no_mmproj", "spec_type", "mmproj",
               "threads_batch"},
     "server": set(),
 }

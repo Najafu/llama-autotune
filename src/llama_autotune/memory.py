@@ -50,10 +50,12 @@ class MemoryEstimate:
     recurrent: int = 0
     compute: int = 0
     runtime: int = 0
+    vision: int = 0  # vision file (mmproj) plus reading one image
 
     @property
     def total(self) -> int:
-        return self.weights + self.repack_copy + self.kv_cache + self.recurrent + self.compute + self.runtime
+        return (self.weights + self.repack_copy + self.kv_cache + self.recurrent + self.compute + self.runtime
+                + self.vision)
 
     @property
     def total_mib(self) -> int:

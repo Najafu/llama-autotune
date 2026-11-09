@@ -80,6 +80,7 @@ def plan_memory(
     compute_override: int | None = None,
     compute_model: ComputeModel | None = None,
     flash_attn: bool | None = None,
+    vision: int = 0,
 ) -> GateDecision:
     """Find the least harmful settings that fit a model into ``budget``.
 
@@ -106,6 +107,7 @@ def plan_memory(
         compute_model: Compute buffer as a function of context, ubatch and
             flash attention; preferred over ``compute_override``.
         flash_attn: The flash-attention setting that will run (None = auto).
+        vision: Bytes of a vision file and its image work (0 without images).
 
     Returns:
         The first fitting :class:`GateDecision`, or the smallest one with
@@ -120,6 +122,7 @@ def plan_memory(
         est = estimate_config_memory(model, state["ctx"], state["cache_type"], state["ubatch"],
                                      state["repack"], isa_tier, tensor_sizes, compute_override,
                                      compute_bytes=compute)
+        est.vision = vision
         return GateDecision(est.total <= budget, state["ctx"], est, budget, state["ubatch"], state["repack"],
                             state["cache_type"], list(savings),
                             flash_attn=True if flash_attn is False and state["flash_attn"] else None)

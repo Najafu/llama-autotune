@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .benchmark import run_benchmark
+from .vision import find_vision_file, is_vision_file, vision_bytes
 from .extra_args import ExtraArgsError, apply_over, describe, merge, parse_extra_args, setting_key
 from .compat import (
     NOT_FOUND_ADVICE, binary_name, llama_found, save_llama_dir, saved_llama_dir,
@@ -270,6 +271,10 @@ def inspect(
     console.print(_model_table(model_info))
     caps = detect_capabilities()
     _loadable(caps, model_info)
+    vision_file = find_vision_file(model, model_info)
+    if vision_file:
+        console.print(f"Vision file: {vision_file.name}. Images are optional (launch --images) and need "
+                      f"{_mib(vision_bytes(vision_file))} on top of the plan below.")
     if hw.backend == Backend.CPU:
         console.print(_memory_plan_table(model_info, hw, mem, tensor_sizes_of(model), caps.build.build_number))
 
@@ -544,6 +549,67 @@ def search(
 _MEMORY_FLAGS = {"-c", "-b", "-ub", "-ctk", "-ctv", "-fa", "--repack", "-np", "-cram", "-ngl", "--mlock"}
 
 
+def _vision_for(model: str, model_info: ModelInfo, wanted: bool, explicit: str | None) -> Path | None:
+    """The vision file to try: the one given, or the matching one next to the model."""
+    if explicit:
+        if not os.path.isfile(explicit) or not is_vision_file(explicit):
+            console.print(f"[red]Not a vision file (mmproj GGUF): {explicit}[/red]")
+            raise typer.Exit(code=1)
+        return Path(explicit)
+    found = find_vision_file(model, model_info)
+    if wanted and found is None:
+        console.print(f"[yellow]No vision file for this model in {Path(model).resolve().parent}: images stay off. "
+                      f"Download the mmproj GGUF that belongs to this model, or name it with --mmproj.[/yellow]")
+    elif not wanted and found is not None:
+        console.print(f"[dim]Tip: {found.name} lets this model read images; add --images to use it.[/dim]")
+    return found if wanted else None
+
+
+def _plan_with_optional_vision(plan, limit: int, want: int, want_max: bool,
+                               vision_file: Path | None) -> tuple[GateDecision, Path | None]:
+    """Fit the model with images when possible; images are optional, context is not.
+
+    With a fixed context, images are kept only when the model fits at that
+    context with them. With ``-c max``, both largest contexts are reported.
+    Otherwise the vision file is left out and the text chat starts.
+    """
+    def text_only() -> GateDecision:
+        return _largest_fitting_context(plan, limit) if want_max else plan(ctx=want, min_ctx=min(2048, want))
+
+    if vision_file is None:
+        return text_only(), None
+    vb = vision_bytes(vision_file)
+    if want_max:
+        with_v = _largest_fitting_context(functools.partial(plan, vision=vb), limit)
+        without = text_only()
+        if with_v.fits:
+            if without.fits and without.ctx > with_v.ctx:
+                console.print(f"With images the largest context is {with_v.ctx:,} tokens; without images it "
+                              f"would be {without.ctx:,}. Leave out --images for the longer context.")
+            return with_v, vision_file
+        if without.fits:
+            console.print(f"[yellow]Images left out: the vision file needs {_mib(vb)} that is not free. "
+                          f"The text chat starts without it.[/yellow]")
+        return without, None
+    with_v = plan(ctx=want, min_ctx=want, vision=vb)
+    if with_v.fits:
+        return with_v, vision_file
+    without = text_only()
+    if without.fits:
+        console.print(f"[yellow]Images left out: at {want:,} tokens of context the vision file ({_mib(vb)}) does "
+                      f"not fit as well (short by {_mib(with_v.shortfall)}). The text chat starts without it; a "
+                      f"smaller -c can make room for images.[/yellow]")
+    return without, None
+
+
+def _ctx_of(args: list[str]) -> int:
+    """The context size in a llama-server argument list (0 when not set)."""
+    for flag in ("-c", "--ctx-size"):
+        if flag in args and args.index(flag) + 1 < len(args) and args[args.index(flag) + 1].isdigit():
+            return int(args[args.index(flag) + 1])
+    return 0
+
+
 def _largest_fitting_context(plan, limit: int) -> GateDecision:
     """Binary search, in steps of 1,024 tokens, for the largest context the gate accepts."""
     best = plan(ctx=2048, min_ctx=2048)
@@ -591,7 +657,10 @@ def launch(
     ctx: str = typer.Option("4096", "-c", "--ctx-size",
                             help="Wanted context size (reduced if it does not fit), or 'max' for the largest "
                                  "that fits in free RAM now"),
-    images: bool = typer.Option(False, "--images", help="Keep the vision projector loaded"),
+    images: bool = typer.Option(False, "--images",
+                                help="Also read images, with the vision file (mmproj) found next to the model. "
+                                     "Optional: left out when it does not fit, the text chat still starts"),
+    mmproj: Optional[str] = typer.Option(None, "--mmproj", help="Vision file to use (implies --images)"),
     editing: bool = typer.Option(False, "--editing",
                                  help="Faster when rewriting or editing text you paste in (speculative decoding)"),
     host: str = typer.Option("127.0.0.1", "--host", help="Server host"),
@@ -646,6 +715,7 @@ def launch(
             raise typer.Exit(code=1)
     else:
         hw = detect_hardware(caps)
+        vision_file = _vision_for(model, model_info, images or bool(mmproj), mmproj)
         limit = model_info.training_context or 131072
         want = limit if want_max else min(int(ctx), limit)
         config = _apply_tuned(generate_initial_config(hw, model_info), hw, model_info,
@@ -658,7 +728,7 @@ def launch(
                 tensor_sizes=tensor_sizes_of(model),
                 compute_model=compute_model_for(model, model_info, caps.build.build_number),
                 flash_attn=config.flash_attn)
-            gate = _largest_fitting_context(plan, limit) if want_max else plan(ctx=want, min_ctx=min(2048, want))
+            gate, vision_file = _plan_with_optional_vision(plan, limit, want, want_max, vision_file)
             if want_max and gate.fits:
                 console.print(f"Largest context that fits now: {gate.ctx:,} tokens "
                               f"(the model supports {limit:,}).")
@@ -671,7 +741,12 @@ def launch(
                 console.print("[yellow]-c max plans system RAM only; on a GPU the model's full context is "
                               "requested and llama.cpp fits it to the GPU.[/yellow]")
             config.ctx_size = want
-        config = apply_launch_defaults(config, hw, model_info, want_images=images)
+        config = apply_launch_defaults(config, hw, model_info, want_images=bool(vision_file))
+        if vision_file:
+            config.mmproj = str(vision_file)
+            config.no_mmproj = None
+            console.print(f"Images on, with {vision_file.name}. Reading an image is slow on a CPU: a "
+                          f"1280x960 screenshot took 94 s and 1,221 tokens of context on the test PC.")
         if editing:
             if caps.server is not None and not caps.server.has("--spec-type"):
                 console.print("[yellow]This llama.cpp build has no --spec-type; --editing is ignored.[/yellow]")
@@ -682,6 +757,9 @@ def launch(
             console.print(f"[yellow]Skipped {s}[/yellow]")
         args = rendered.args
 
+    # A short model name for apps (opencode's modelID and the like) instead of the full file path.
+    if caps.server is None or caps.server.has("--alias"):
+        args = [*args, "--alias", Path(model).stem]
     args, replaced = apply_over(args, pairs, caps.server)
     if replaced:
         console.print(f"[dim]Your options replace: {' '.join(replaced)}[/dim]")
@@ -691,6 +769,8 @@ def launch(
     if dry_run:
         return
     console.print(f"Open http://{host}:{port} in your browser to chat. Press Ctrl+C to stop.")
+    console.print(f"For apps such as coding agents: base URL http://{host}:{port}/v1, model name "
+                  f"{Path(model).stem}, context {_ctx_of(args) or 'default'} tokens.")
     try:
         proc = subprocess.run(cmd, env=clean_env())
     except FileNotFoundError:
