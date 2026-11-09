@@ -1,4 +1,4 @@
-"""SQLite storage for benchmark history and launch profiles.
+"""SQLite storage for benchmark history, tuned settings and launch profiles.
 
 Uses the standard-library ``sqlite3`` module. The schema is versioned
 with ``PRAGMA user_version`` and upgrades databases written by v0.3.0 in
@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import BenchmarkEntry, LaunchProfile
+from .models import BenchmarkEntry, LaunchProfile, SearchConfig
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS benchmarks (
@@ -39,6 +40,21 @@ CREATE TABLE IF NOT EXISTS launch_profiles (
     hardware TEXT,
     created TEXT,
     score REAL
+);
+CREATE TABLE IF NOT EXISTS tuned_settings (
+    id INTEGER PRIMARY KEY,
+    hardware_id TEXT,
+    model_id TEXT,
+    llama_build INTEGER,
+    config_json TEXT,
+    generation_tps REAL,
+    prompt_tps REAL,
+    baseline_tps REAL,
+    ctx INTEGER,
+    efficiency REAL,
+    bandwidth_gbs REAL,
+    model_path TEXT,
+    timestamp TEXT
 );
 """
 
@@ -158,4 +174,61 @@ def get_launch_profile(conn: sqlite3.Connection, name: str) -> LaunchProfile | N
         name=row["name"], args=json.loads(row["args_json"] or "[]"), model_path=row["model_path"] or "",
         hardware=row["hardware"] or "", created=row["created"] or "", score=row["score"] or 0.0,
         llama_build=row["llama_build"] or 0,
+    )
+
+
+@dataclass
+class TunedSettings:
+    """Settings found by ``tune`` for one model on one machine."""
+
+    config: SearchConfig
+    llama_build: int = 0
+    generation_tps: float = 0.0
+    prompt_tps: float = 0.0
+    baseline_tps: float = 0.0
+    ctx: int = 0
+    efficiency: float = 0.0
+    bandwidth_gbs: float = 0.0
+    model_path: str = ""
+    timestamp: str = ""
+
+
+def save_tuned(conn: sqlite3.Connection, hardware_id: str, model_id: str, tuned: TunedSettings) -> None:
+    """Store the result of a tuning run; the newest one per machine and model is used."""
+    conn.execute(
+        """INSERT INTO tuned_settings (hardware_id, model_id, llama_build, config_json, generation_tps,
+               prompt_tps, baseline_tps, ctx, efficiency, bandwidth_gbs, model_path, timestamp)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (hardware_id, model_id, tuned.llama_build, tuned.config.model_dump_json(exclude_none=True),
+         tuned.generation_tps, tuned.prompt_tps, tuned.baseline_tps, tuned.ctx, tuned.efficiency,
+         tuned.bandwidth_gbs, tuned.model_path, tuned.timestamp or datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def best_bandwidth(conn: sqlite3.Connection, hardware_id: str) -> float:
+    """Highest memory bandwidth (GB/s) ever measured on this machine, or 0.
+
+    Other programs can only make the copy test slower, never faster, so the
+    best result is the machine's real bandwidth.
+    """
+    row = conn.execute("SELECT MAX(bandwidth_gbs) FROM tuned_settings WHERE hardware_id = ?",
+                       (hardware_id,)).fetchone()
+    return float(row[0] or 0.0)
+
+
+def get_tuned(conn: sqlite3.Connection, hardware_id: str, model_id: str) -> TunedSettings | None:
+    """Return the newest tuning result for a machine and model, or None."""
+    row = conn.execute(
+        "SELECT * FROM tuned_settings WHERE hardware_id = ? AND model_id = ? ORDER BY id DESC LIMIT 1",
+        (hardware_id, model_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return TunedSettings(
+        config=SearchConfig.model_validate_json(row["config_json"] or "{}"), llama_build=row["llama_build"] or 0,
+        generation_tps=row["generation_tps"] or 0.0, prompt_tps=row["prompt_tps"] or 0.0,
+        baseline_tps=row["baseline_tps"] or 0.0, ctx=row["ctx"] or 0, efficiency=row["efficiency"] or 0.0,
+        bandwidth_gbs=row["bandwidth_gbs"] or 0.0, model_path=row["model_path"] or "",
+        timestamp=row["timestamp"] or "",
     )

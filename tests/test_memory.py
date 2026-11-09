@@ -60,6 +60,27 @@ def test_kv_layout_hybrid_recurrent():
     assert kv_cache_bytes(layout, 4096) == 128 * MIB
 
 
+def test_kv_layout_short_convolution():
+    head_kv = [4 if il % 2 == 0 and 2 <= il <= 22 else 0 for il in range(24)]   # 11 attention layers
+    kv = {"general.architecture": "lfm3", "lfm3.block_count": 24, "lfm3.embedding_length": 2048,
+          "lfm3.attention.head_count": 16, "lfm3.attention.head_count_kv": head_kv,
+          "lfm3.shortconv.l_cache": 7}
+    layout = kv_layout(kv, "lfm3")
+    assert layout.recurrent_bytes == 13 * 4 * 6 * 2048                  # 0.61 MiB, llama.cpp b12228 log
+
+
+LFM3 = os.path.join(MODELS, "uncensored", "lfm", "LFM3-1.7B-Uncensored-AD-Q4_K_M.gguf")
+
+
+@pytest.mark.skipif(not os.path.isfile(LFM3), reason="LFM3 model not present on this machine")
+def test_lfm3_memory_matches_llama_cpp():
+    m = inspect_model(LFM3)
+    # llama-server b12228, -c 4096: KV 48 MiB full + 7.5 MiB sliding window, RS 0.61 MiB
+    assert kv_cache_bytes(m.kv_layout, 4096) == int(55.5 * MIB)
+    assert round(m.kv_layout.recurrent_bytes / MIB, 2) == 0.61
+    assert round(repack_copy_bytes(m, "avx2", tensor_sizes_of(LFM3)) / MIB) == 496
+
+
 def test_kv_cache_quantized_types():
     layout = KVLayout(k_elems_full=1024, v_elems_full=1024)
     f16 = kv_cache_bytes(layout, 4096)
@@ -101,8 +122,10 @@ def test_estimate_memory_parts():
     assert est.weights == 1000 * MIB
     assert est.repack_copy == 600 * MIB
     assert est.kv_cache == 128 * MIB
-    assert est.total_mib == 1000 + 600 + 128 + 258
+    assert est.runtime == 128_256 * 384                     # tokenizer and the like: 47 MiB
+    assert est.total_mib == 1000 + 600 + 128 + 258 + 47
     assert estimate_memory(_model(), 4096, repack=False).repack_copy == 0
+    assert estimate_memory(_model(vocab_size=0), 4096).runtime == 32 * MIB
 
 
 def test_safety_margin_and_budget():
@@ -169,3 +192,46 @@ def test_real_models_match_llama_cpp(rel, kv_mib, repack_mib):
     layout = m.kv_layout
     assert round((kv_cache_bytes(layout, 4096) + layout.recurrent_bytes) / MIB) == kv_mib
     assert round(repack_copy_bytes(m, "avx2", tensor_sizes_of(path)) / MIB) == repack_mib
+
+
+# ── compute buffer model (llama.cpp b12228, experiment E1b) ──────────
+
+def _cm(base_mib, vocab, n_embd, heads, server=False):
+    from llama_autotune.memory import ComputeModel
+    return ComputeModel(base_mib * MIB, vocab, n_embd, heads, single_output=server)
+
+
+# (base at 4K fa on, vocab, n_embd, heads, ctx, ubatch, fa, llama-bench MiB, llama-server MiB)
+MEASURED = [
+    (274, 128256, 2048, 32, 4096, 512, True, 274, 72.02),    # Llama 3.2 1B
+    (274, 128256, 2048, 32, 4096, 512, False, 290, 290.01),
+    (274, 128256, 2048, 32, 16384, 512, False, 1082, 1082.01),
+    (274, 128256, 2048, 32, 16384, 512, True, 290, 84.02),
+    (274, 128256, 2048, 32, 4096, 256, False, 145, 145.01),
+    (274, 128000, 2048, 16, 4096, 512, False, 283, 165.52),  # LFM3 1.7B
+    (513, 248320, 2048, 8, 16384, 512, False, 539, 318.02),  # Qwen3.5 2B
+    (566, 262144, 1536, 8, 4096, 512, True, 566, 84.53),     # Gemma 4 E2B
+    (514, 248320, 2560, 16, 4096, 512, False, 527, 189.02),  # Qwen3.5 4B
+]
+
+
+@pytest.mark.parametrize("base,vocab,embd,heads,ctx,ub,fa,bench,server", MEASURED)
+def test_compute_model_never_below_llama_cpp(base, vocab, embd, heads, ctx, ub, fa, bench, server):
+    b = _cm(base, vocab, embd, heads).bytes(ctx, ub, fa) / MIB
+    s = _cm(base, vocab, embd, heads, server=True).bytes(ctx, ub, fa) / MIB
+    assert bench <= b <= bench + 70
+    assert server <= s <= server + 60
+
+
+def test_gate_counts_attention_scores_and_turns_flash_attention_on():
+    """Llama 3.2 1B, 16K context, flash attention off: the scores alone are 1 GiB."""
+    cm = _cm(274, 128256, 2048, 32, server=True)
+    model = _model(kv_layout=KVLayout(k_elems_full=16 * 8 * 64, v_elems_full=16 * 8 * 64), tensor_types={})
+    need_off = plan_memory(model, 10**12, ctx=16384, compute_model=cm, flash_attn=False).estimate.total
+    need_on = plan_memory(model, 10**12, ctx=16384, compute_model=cm, flash_attn=True).estimate.total
+    assert need_off - need_on >= 1000 * MIB                  # 1,024 MiB of scores, minus the mask term
+    gate = plan_memory(model, need_on + 50 * MIB, ctx=16384, min_ctx=16384, compute_model=cm, flash_attn=False)
+    assert gate.fits and gate.flash_attn is True and gate.ctx == 16384
+    assert any("flash attention on" in s for s in gate.savings)
+    from llama_autotune.models import SearchConfig
+    assert gate.apply(SearchConfig(flash_attn=False)).flash_attn is True

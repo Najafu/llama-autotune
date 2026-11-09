@@ -1,9 +1,10 @@
 """CLI interface for llama-autotune.
 
 Commands: ``doctor`` (system and llama.cpp check), ``inspect`` (model and
-memory plan), ``benchmark``, ``search``, ``launch``, ``export`` and
-``import``. Memory is always planned against the RAM available now, and
-llama.cpp arguments always come from the compatibility layer.
+memory plan), ``tune`` (measured CPU tuning), ``launch``, ``benchmark``,
+``search``, ``export`` and ``import``. Memory is always planned against
+the RAM available now, and llama.cpp arguments always come from the
+compatibility layer.
 """
 
 from __future__ import annotations
@@ -22,22 +23,29 @@ from rich.console import Console
 from rich.table import Table
 
 from .benchmark import run_benchmark
-from .compat import clean_env, config_ini_paths, detect_capabilities, llama_env_overrides, render_args
+from .compat import (
+    Capabilities, architecture_supported, clean_env, config_ini_paths, detect_capabilities,
+    llama_env_overrides, render_args, update_llama_advice,
+)
 from .constraints import GateDecision, memory_budget, plan_memory, safety_margin
-from .database import get_session, save_benchmark
+from datetime import datetime, timezone
+
+from .database import TunedSettings, best_bandwidth, get_session, get_tuned, save_benchmark, save_tuned
 from .hardware import detect_hardware, hardware_fingerprint
 from .heuristics import apply_launch_defaults, generate_initial_config
-from .memory import MIB, compute_buffer_for, estimate_memory, kv_cache_bytes, tensor_sizes_of
+from .memory import MIB, compute_model_for, estimate_memory, kv_cache_bytes, tensor_sizes_of
 from .model_inspector import inspect_model
 from .models import Backend, BenchmarkEntry, HardwareInfo, ModelInfo, OptimizeObjective, SearchConfig
 from .optimizer import Optimizer
 from .profiles import create_profile, export_profile, import_profile
 from .resources import MemoryStatus, measure_bandwidth, memory_status, power_status
+from .tuner import VERDICT_REASONS, Tuner, TuneReport
 
 EXAMPLES = (
     "[bold]Examples:[/bold]\n\n"
     "  llama-autotune doctor\n\n"
     "  llama-autotune inspect model.gguf\n\n"
+    "  llama-autotune tune model.gguf\n\n"
     "  llama-autotune launch model.gguf\n\n"
     "  llama-autotune benchmark model.gguf -r 3\n\n"
     "  llama-autotune search model.gguf --objective max_generation_tps --profile best.json\n\n"
@@ -62,6 +70,14 @@ def _require_model_file(path: str) -> None:
         raise typer.Exit(code=1)
 
 
+def _loadable(caps: Capabilities, model_info: ModelInfo) -> bool:
+    """Print plain advice and return False when llama.cpp is too old for this model."""
+    if architecture_supported(caps, model_info.architecture) is False:
+        console.print(f"[red]{update_llama_advice(model_info.architecture, caps.build.build_number)}[/red]")
+        return False
+    return True
+
+
 def _mib(n: int | float) -> str:
     return f"{round(n / MIB):,} MiB"
 
@@ -79,6 +95,8 @@ def _hardware_table(hw: HardwareInfo, mem: MemoryStatus) -> Table:
     cores = f"{hw.physical_cores} cores / {hw.logical_cores} threads"
     if hw.efficiency_cores:
         cores += f" ({hw.performance_cores} performance + {hw.efficiency_cores} efficiency)"
+    if hw.numa_nodes > 1:
+        cores += f", {hw.numa_nodes} NUMA nodes (multi-socket)"
     table.add_row("Cores", cores)
     if hw.cpu_variant:
         table.add_row("CPU instructions", f"{hw.isa_tier} (llama.cpp uses ggml-cpu-{hw.cpu_variant})")
@@ -112,7 +130,9 @@ def _model_table(m: ModelInfo) -> Table:
     return table
 
 
-def _memory_plan_table(model: ModelInfo, hw: HardwareInfo, mem: MemoryStatus, sizes: dict) -> Table:
+def _memory_plan_table(model: ModelInfo, hw: HardwareInfo, mem: MemoryStatus, sizes: dict,
+                       server_build: int = 0) -> Table:
+    """What llama-server needs at each context with its defaults (flash attention auto)."""
     budget = memory_budget(mem.available, mem.total)
     table = Table(title=f"Memory plan (free now {_mib(mem.available)}, "
                         f"keeping {_mib(safety_margin(mem.total))} spare)", box=box.ROUNDED)
@@ -123,14 +143,15 @@ def _memory_plan_table(model: ModelInfo, hw: HardwareInfo, mem: MemoryStatus, si
     if model.training_context and model.training_context not in contexts:
         contexts.append(model.training_context)
     tier = hw.isa_tier or "avx2"
+    cm = compute_model_for(model.path, model, server_build=server_build)
     for ctx in contexts:
-        compute = compute_buffer_for(model.path, ctx)
+        compute = cm.bytes(ctx) if cm else None
         default = estimate_memory(model, ctx, isa_tier=tier, tensor_sizes=sizes, compute_override=compute)
         if default.total <= budget:
             verdict = "[green]Fits[/green]"
         else:
             plan = plan_memory(model, budget, isa_tier=tier, ctx=ctx, min_ctx=ctx, tensor_sizes=sizes,
-                               compute_override=compute)
+                               compute_model=cm)
             if plan.fits:
                 verdict = f"[yellow]Fits with: {', '.join(s.split(' (')[0] for s in plan.savings)}[/yellow]"
             else:
@@ -158,7 +179,8 @@ def doctor(
     if mem.commit_limit:
         sys_table.add_row("Commit headroom", _mib(mem.commit_headroom))
     if bandwidth:
-        sys_table.add_row("Memory bandwidth", f"{measure_bandwidth()} GB/s")
+        threads = min(hw.performance_cores or hw.physical_cores or 1, 16)
+        sys_table.add_row("Memory bandwidth", f"{measure_bandwidth(threads=threads)} GB/s")
     console.print(sys_table)
 
     llama = _table("llama.cpp")
@@ -205,8 +227,153 @@ def inspect(
         raise typer.Exit(code=1)
     console.print(_hardware_table(hw, mem))
     console.print(_model_table(model_info))
+    caps = detect_capabilities()
+    _loadable(caps, model_info)
     if hw.backend == Backend.CPU:
-        console.print(_memory_plan_table(model_info, hw, mem, tensor_sizes_of(model)))
+        console.print(_memory_plan_table(model_info, hw, mem, tensor_sizes_of(model), caps.build.build_number))
+
+
+def _onoff(value: bool | None) -> str:
+    return "auto" if value is None else ("on" if value else "off")
+
+
+def _print_tune_report(rep: TuneReport, model: str) -> None:
+    if rep.status == "wont_fit":
+        return
+    if rep.status == "prediction_only":
+        console.print(f"[bold]Verdict: {rep.verdict}[/bold] (predicted, not measured): about "
+                      f"{rep.predicted_tps:.2f} tokens per second; {VERDICT_REASONS[rep.verdict]}.")
+        for note in rep.notes:
+            console.print(f"  {note}")
+        return
+    if rep.status == "unsupported":
+        console.print(f"[red]{rep.error}[/red]")
+        return
+    if rep.status != "tuned" or rep.config is None:
+        console.print(f"[red]Tuning failed[/red] ({rep.error or 'no results'}).")
+        for w in rep.warnings:
+            console.print(f"[yellow]Warning:[/yellow] {w}")
+        return
+
+    colour = {"Fast": "green", "Usable": "yellow", "Slow": "red"}.get(rep.verdict, "white")
+    console.print(f"\n[bold {colour}]Verdict: {rep.verdict}[/bold {colour}]: about {rep.best_tps:.1f} tokens per "
+                  f"second; {VERDICT_REASONS[rep.verdict]}.")
+
+    cfg, base = rep.config, rep.baseline
+    table = Table(title="Settings", box=box.ROUNDED)
+    table.add_column("Setting", style="cyan")
+    table.add_column("llama.cpp default")
+    table.add_column("Tuned", style="green")
+    table.add_row("Threads (writing)", str(base.threads), str(cfg.threads or base.threads))
+    table.add_row("Threads (reading the prompt)", str(base.threads), str(cfg.threads_batch or cfg.threads or base.threads))
+    table.add_row("Flash attention", _onoff(base.flash_attn), _onoff(cfg.flash_attn))
+    if base.repack is not None or cfg.repack is not None:
+        table.add_row("Weight repacking", _onoff(base.repack), _onoff(cfg.repack if cfg.repack is not None else base.repack))
+    if cfg.ubatch_size:
+        table.add_row("Prompt batch (ubatch)", "512", str(cfg.ubatch_size))
+    if cfg.numa:
+        table.add_row("NUMA", "off", cfg.numa)
+    if cfg.priority:
+        table.add_row("Priority", "normal", "above normal")
+    console.print(table)
+
+    speed = Table(title="Speed (tokens per second)", box=box.ROUNDED)
+    speed.add_column("")
+    speed.add_column("Default", justify="right")
+    speed.add_column("Tuned", justify="right", style="green")
+    speed.add_row("Writing (generation)", f"{rep.baseline_tps:.1f}", f"{rep.best_tps:.1f} ({rep.gain:+.0%})")
+    if rep.baseline_pp and rep.best_pp:
+        speed.add_row("Reading the prompt", f"{rep.baseline_pp:.1f}", f"{rep.best_pp:.1f}")
+    if rep.depth_tps:
+        speed.add_row(f"Writing after {rep.depth:,} tokens of chat", "", f"{rep.depth_tps:.1f}")
+    console.print(speed)
+
+    if rep.predicted_tps:
+        console.print(f"[dim]Memory speed {rep.bandwidth_gbs} GB/s; predicted {rep.predicted_tps:.1f} tokens/s "
+                      f"before measuring, this model reaches {rep.efficiency:.0%} of the bandwidth limit. "
+                      f"{rep.tests} tests in {rep.elapsed / 60:.1f} min.[/dim]")
+    for note in rep.notes:
+        console.print(f"  {note}")
+    for w in rep.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {w}")
+
+
+@app.command(help="Find the fastest settings for a model on this PC by measuring (up to 10 minutes).")
+def tune(
+    model: str = typer.Argument(..., help="Path to GGUF model file"),
+    ctx: int = typer.Option(4096, "-c", "--ctx-size", help="Context size you want to chat with"),
+    minutes: float = typer.Option(10.0, "--minutes", help="Time limit for the measurements"),
+    output_profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Also save a launch profile file"),
+):
+    """Measure llama.cpp's defaults and better settings, then save the winner for ``launch``."""
+    _require_model_file(model)
+    caps = detect_capabilities()
+    hw = detect_hardware(caps)
+    if hw.backend != Backend.CPU:
+        console.print("[yellow]tune measures CPU settings. GPU tuning comes in a later version; "
+                      "`launch` already lets llama.cpp fit the model to your GPU.[/yellow]")
+        raise typer.Exit(code=1)
+    conn = get_session()
+    known_bw = best_bandwidth(conn, hardware_fingerprint(hw))
+    conn.close()
+    tuner = Tuner(model, ctx=ctx, budget_s=minutes * 60, caps=caps, hw=hw, known_bandwidth=known_bw,
+                  say=lambda msg: console.print(f"[dim]{msg}[/dim]"))
+    if not _loadable(caps, tuner.model):
+        raise typer.Exit(code=1)
+    mem = memory_status()
+    console.print(_hardware_table(hw, mem))
+    gate = tuner.plan()
+    _print_gate(gate, mem)
+    if not gate.fits:
+        raise typer.Exit(code=1)
+
+    rep = tuner.run()
+    _print_tune_report(rep, model)
+    if rep.status != "tuned" or rep.config is None:
+        raise typer.Exit(code=0 if rep.status == "prediction_only" else 1)
+
+    tuned_cfg = rep.config.model_copy(update={"ctx_size": None})
+    conn = get_session()
+    save_tuned(conn, hardware_fingerprint(hw), tuner.model.fingerprint, TunedSettings(
+        config=tuned_cfg, llama_build=caps.build.build_number, generation_tps=rep.best_tps,
+        prompt_tps=rep.best_pp, baseline_tps=rep.baseline_tps, ctx=gate.ctx, efficiency=rep.efficiency,
+        bandwidth_gbs=rep.bandwidth_gbs, model_path=model,
+    ))
+    conn.close()
+
+    if output_profile:
+        launch_cfg = apply_launch_defaults(rep.config.model_copy(update={"ctx_size": gate.ctx}), hw, tuner.model)
+        profile = create_profile(
+            name=Path(output_profile).stem, args=render_args(launch_cfg, "server", caps.server).args,
+            model_path=model, hardware=hw.cpu_name, score=rep.best_tps, llama_build=caps.build.build_number,
+        )
+        console.print(f"[green]Profile saved to {export_profile(profile, output_profile)}[/green]")
+    console.print(f"\n[green]Saved.[/green] Start chatting with these settings:  "
+                  f"llama-autotune launch {subprocess.list2cmdline([model])}")
+
+
+def _apply_tuned(config: SearchConfig, hw: HardwareInfo, model_info: ModelInfo, build: int) -> SearchConfig:
+    """Overlay the settings saved by ``tune`` for this machine and model."""
+    conn = get_session()
+    try:
+        tuned = get_tuned(conn, hardware_fingerprint(hw), model_info.fingerprint)
+    finally:
+        conn.close()
+    if tuned is None:
+        if hw.backend == Backend.CPU:
+            console.print("[dim]Tip: run `llama-autotune tune` once to measure the fastest settings "
+                          "for this model.[/dim]")
+        return config
+    # A setting tune left at None was measured at llama.cpp's own default and won,
+    # so it replaces the heuristic guess too (e.g. flash attention "auto", not "off").
+    keep = ("threads", "threads_batch", "flash_attn", "repack", "ubatch_size", "numa")
+    update = {k: v for k, v in tuned.config.model_dump().items() if k in keep}
+    when = tuned.timestamp[:10]
+    console.print(f"Using settings measured by tune on {when} ({tuned.generation_tps:.1f} tokens/s).")
+    if tuned.llama_build and build and tuned.llama_build != build:
+        console.print(f"[yellow]They were measured on llama.cpp b{tuned.llama_build}; b{build} is installed "
+                      "now. Run tune again to re-check.[/yellow]")
+    return config.model_copy(update=update)
 
 
 @app.command(help="Run a benchmark with optional custom parameters.")
@@ -227,6 +394,8 @@ def benchmark(
     caps = detect_capabilities()
     hw = detect_hardware(caps)
     model_info = inspect_model(model)
+    if not _loadable(caps, model_info):
+        raise typer.Exit(code=1)
 
     explicit = {"threads": threads, "batch_size": batch_size, "ubatch_size": ubatch_size,
                 "n_gpu_layers": n_gpu_layers, "flash_attn": flash_attn, "repack": repack}
@@ -266,7 +435,7 @@ def benchmark(
         raise typer.Exit(code=1)
 
 
-@app.command(help="Auto-optimize config via 3-stage search.")
+@app.command(help="Advanced: search many settings with Optuna (for GPUs; on a CPU use tune).")
 def search(
     model: str = typer.Argument(..., help="Path to GGUF model file"),
     objective: str = typer.Option("balanced", "--objective", "-O", help="Optimization objective"),
@@ -284,6 +453,8 @@ def search(
         raise typer.Exit(code=1)
 
     opt = Optimizer(model_path=model, objective=obj, n_trials_stage_b=trials_b, n_trials_stage_c=trials_c)
+    if not _loadable(opt.caps, opt.model):
+        raise typer.Exit(code=1)
     mem = memory_status()
     console.print(_hardware_table(opt.hw, mem))
     if opt.gate is not None:
@@ -345,6 +516,8 @@ def launch(
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Path to profile JSON"),
     ctx: int = typer.Option(4096, "-c", "--ctx-size", help="Wanted context size (reduced if it does not fit)"),
     images: bool = typer.Option(False, "--images", help="Keep the vision projector loaded"),
+    editing: bool = typer.Option(False, "--editing",
+                                 help="Faster when rewriting or editing text you paste in (speculative decoding)"),
     host: str = typer.Option("127.0.0.1", "--host", help="Server host"),
     port: int = typer.Option(8080, "--port", help="Server port"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the command without starting the server"),
@@ -352,6 +525,8 @@ def launch(
     """Plan memory, apply safe defaults and start llama-server."""
     _require_model_file(model)
     caps = detect_capabilities()
+    if not _loadable(caps, inspect_model(model)):
+        raise typer.Exit(code=1)
     if profile:
         if not os.path.isfile(profile):
             console.print(f"[red]Error: profile file not found: {profile}[/red]")
@@ -370,13 +545,15 @@ def launch(
         model_info = inspect_model(model)
         if model_info.training_context:
             ctx = min(ctx, model_info.training_context)
-        config = generate_initial_config(hw, model_info)
+        config = _apply_tuned(generate_initial_config(hw, model_info), hw, model_info,
+                              caps.build.build_number)
         if hw.backend == Backend.CPU:
             mem = memory_status()
             gate = plan_memory(model_info, memory_budget(mem.available, mem.total),
                                isa_tier=hw.isa_tier or "avx2", ctx=ctx, min_ctx=min(2048, ctx),
                                ubatch=config.ubatch_size or 512, tensor_sizes=tensor_sizes_of(model),
-                               compute_override=compute_buffer_for(model, ctx))
+                               compute_model=compute_model_for(model, model_info, caps.build.build_number),
+                               flash_attn=config.flash_attn)
             _print_gate(gate, mem)
             if not gate.fits:
                 raise typer.Exit(code=1)
@@ -384,6 +561,11 @@ def launch(
         else:
             config.ctx_size = ctx
         config = apply_launch_defaults(config, hw, model_info, want_images=images)
+        if editing:
+            if caps.server is not None and not caps.server.has("--spec-type"):
+                console.print("[yellow]This llama.cpp build has no --spec-type; --editing is ignored.[/yellow]")
+            else:
+                config.spec_type = "ngram-mod"
         rendered = render_args(config, "server", caps.server)
         for s in rendered.skipped:
             console.print(f"[yellow]Skipped {s}[/yellow]")

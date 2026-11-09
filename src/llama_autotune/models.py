@@ -71,6 +71,7 @@ class HardwareInfo(BaseModel):
     performance_cores: int = 0
     efficiency_cores: int = 0
     performance_threads: int = 0
+    numa_nodes: int = 1
     ram_gb: float = 0.0
     ram_available_gb: float = 0.0
     gpu_count: int = 0
@@ -181,6 +182,7 @@ class SearchConfig(BaseModel):
     ctx_checkpoints: int | None = None
     no_mmproj: bool | None = None
     spec_type: str | None = None
+    priority: int | None = None  # --prio: 0 normal, 1 above normal, 2 high
 
     def to_bench_args(self) -> list[str]:
         """Render as ``llama-bench`` arguments using current llama.cpp flags.

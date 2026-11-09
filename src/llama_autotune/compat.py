@@ -334,6 +334,72 @@ def detect_capabilities(use_cache: bool = True) -> Capabilities:
     return caps
 
 
+# ── model architectures a build can load ─────────────────────────────
+
+# llama.cpp keeps every architecture name it can load as a C string in its
+# library (the LLM_ARCH_NAMES table), so a byte search answers "can this
+# build load a <arch> model?" without loading anything. "llama" is in every
+# build: when it is missing the file is not a llama.cpp library we understand.
+_LIBRARY_NAMES = ("llama.dll", "libllama.so", "libllama.dylib")
+_SENTINEL_ARCH = "llama"
+
+
+def _library_candidates(caps: Capabilities) -> list[Path]:
+    found: list[Path] = []
+    for binary in (caps.bench_path, caps.server_path):
+        if not binary or not os.path.isfile(binary):
+            continue
+        folder = Path(binary).resolve().parent
+        for name in _LIBRARY_NAMES:
+            for path in [folder / name, *sorted(folder.glob(name + ".*"))]:
+                if path.is_file() and path not in found:
+                    found.append(path)
+        found.append(Path(binary).resolve())  # static builds carry the table in the executable
+    return found
+
+
+def architecture_supported(caps: Capabilities, arch: str) -> bool | None:
+    """Tell whether the installed llama.cpp can load models of ``arch``.
+
+    Args:
+        caps: Detected capabilities (only the binary paths are used).
+        arch: The model's ``general.architecture``, e.g. ``"lfm3"``.
+
+    Returns:
+        ``True`` or ``False`` when the build's architecture table was found,
+        ``None`` when it could not be checked (then the first run tells).
+    """
+    if not arch:
+        return None
+    needle = b"\0" + arch.encode() + b"\0"
+    sentinel = b"\0" + _SENTINEL_ARCH.encode() + b"\0"
+    table_seen = False
+    for path in _library_candidates(caps):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if needle in data:
+            return True
+        table_seen = table_seen or sentinel in data
+    return False if table_seen else None
+
+
+def unknown_architecture(text: str) -> str:
+    """Return the architecture named in llama.cpp's load error, or ``""``."""
+    m = re.search(r"unknown model architecture:\s*'([^']+)'", text)
+    return m.group(1) if m else ""
+
+
+def update_llama_advice(arch: str, build: int) -> str:
+    """Plain-words advice when the installed llama.cpp is too old for a model."""
+    which = f"Your llama.cpp (b{build})" if build else "Your llama.cpp"
+    zip_hint = " (for a PC without a GPU: the file ending in bin-win-cpu-x64.zip)" if os.name == "nt" else ""
+    return (f"{which} cannot load '{arch}' models: this model type is newer than your llama.cpp. "
+            f"Download the newest release from https://github.com/ggml-org/llama.cpp/releases{zip_hint}, "
+            f"unzip it into your llama.cpp folder, and run the command again.")
+
+
 # ── rendering a config into arguments ────────────────────────────────
 
 
@@ -407,6 +473,16 @@ def _legacy_load_bench(v, reg):
     return None
 
 
+def _priority_server(v, reg):
+    """``--prio`` for generation and ``--prio-batch`` for prompt threads."""
+    if reg is not None and not reg.has("--prio"):
+        return None
+    args = ["--prio", str(v)]
+    if reg is None or reg.has("--prio-batch"):
+        args += ["--prio-batch", str(v)]
+    return args
+
+
 def _enum_value(v) -> str:
     return getattr(v, "value", str(v))
 
@@ -438,6 +514,7 @@ _SPELLINGS: dict[str, dict[str, list[_Emit]]] = {
         "ctx_checkpoints": [_value("-ctxcp")],
         "no_mmproj": [_switch("--no-mmproj")],
         "spec_type": [_value("--spec-type")],
+        "priority": [_priority_server],
     },
     "bench": {
         "threads": [_value("-t")],
@@ -451,6 +528,7 @@ _SPELLINGS: dict[str, dict[str, list[_Emit]]] = {
         "cache_type_k": [_value("-ctk")],
         "cache_type_v": [_value("-ctv")],
         "load_mode": [_value("-lm", _enum_value), _legacy_load_bench],
+        "priority": [_value("--prio")],
         "repack": [_bool_value("--repack", "1", "0")],
         "numa": [_value("--numa")],
         "cpu_affinity": [_value("-C")],

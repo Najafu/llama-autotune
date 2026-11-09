@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .memory import MIB, MemoryEstimate, estimate_memory
+from .memory import MIB, ComputeModel, MemoryEstimate, estimate_memory
 from .models import Backend, HardwareInfo, ModelInfo, SearchConfig
 
 GIB = 1024**3
@@ -44,6 +44,7 @@ class GateDecision:
     repack: bool = True
     cache_type: str = "f16"
     savings: list[str] = field(default_factory=list)
+    flash_attn: bool | None = None  # set to True when turning it on was a saving
 
     @property
     def shortfall(self) -> int:
@@ -59,9 +60,10 @@ class GateDecision:
             cfg.batch_size = self.ubatch
         if not self.repack:
             cfg.repack = False
+        if self.cache_type != "f16" or self.flash_attn:
+            cfg.flash_attn = True
         if self.cache_type != "f16":
             cfg.cache_type_k = cfg.cache_type_v = self.cache_type
-            cfg.flash_attn = True
         return cfg
 
 
@@ -76,6 +78,8 @@ def plan_memory(
     allow_kv_quant: bool = True,
     tensor_sizes: dict[str, tuple[str, int]] | None = None,
     compute_override: int | None = None,
+    compute_model: ComputeModel | None = None,
+    flash_attn: bool | None = None,
 ) -> GateDecision:
     """Find the least harmful settings that fit a model into ``budget``.
 
@@ -83,8 +87,10 @@ def plan_memory(
 
     1. smaller ubatch (256, then 128): no speed cost on CPU in testing,
     2. weight repacking off: saves the private copy, costs some speed,
-    3. q8_0 KV cache: halves the cache, needs flash attention,
-    4. shorter context, halving down to ``min_ctx``.
+    3. flash attention on, when it was off: its attention scores grow with
+       the context (1 GiB for Llama 3.2 1B at 16K),
+    4. q8_0 KV cache: halves the cache, needs flash attention,
+    5. shorter context, halving down to ``min_ctx``.
 
     Args:
         model: Inspected model.
@@ -96,23 +102,32 @@ def plan_memory(
         allow_kv_quant: Permit a q8_0 KV cache (avoid for tool calling).
         tensor_sizes: Optional per-tensor sizes for exact repack accounting.
         compute_override: Compute-buffer bytes reported by llama.cpp at
-            ubatch 512.
+            ubatch 512 (used when no ``compute_model`` is given).
+        compute_model: Compute buffer as a function of context, ubatch and
+            flash attention; preferred over ``compute_override``.
+        flash_attn: The flash-attention setting that will run (None = auto).
 
     Returns:
         The first fitting :class:`GateDecision`, or the smallest one with
         ``fits=False`` when nothing fits.
     """
-    state = {"ctx": ctx, "ubatch": ubatch, "repack": True, "cache_type": "f16"}
+    state = {"ctx": ctx, "ubatch": ubatch, "repack": True, "cache_type": "f16", "flash_attn": flash_attn}
     savings: list[str] = []
 
     def check() -> GateDecision:
+        fa = True if state["cache_type"] != "f16" else state["flash_attn"]
+        compute = None if compute_model is None else compute_model.bytes(state["ctx"], state["ubatch"], fa)
         est = estimate_config_memory(model, state["ctx"], state["cache_type"], state["ubatch"],
-                                     state["repack"], isa_tier, tensor_sizes, compute_override)
-        return GateDecision(est.total <= budget, state["ctx"], est, budget,
-                            state["ubatch"], state["repack"], state["cache_type"], list(savings))
+                                     state["repack"], isa_tier, tensor_sizes, compute_override,
+                                     compute_bytes=compute)
+        return GateDecision(est.total <= budget, state["ctx"], est, budget, state["ubatch"], state["repack"],
+                            state["cache_type"], list(savings),
+                            flash_attn=True if flash_attn is False and state["flash_attn"] else None)
 
     decision = check()
     steps = [("ubatch", u) for u in (256, 128) if u < ubatch] + [("repack", False)]
+    if flash_attn is False and compute_model is not None:
+        steps.append(("flash_attn", True))
     if allow_kv_quant:
         steps.append(("cache_type", "q8_0"))
     for key, value in steps:
@@ -135,16 +150,19 @@ def plan_memory(
 
 def estimate_config_memory(model: ModelInfo, ctx: int, cache_type: str, ubatch: int, repack: bool,
                            isa_tier: str, tensor_sizes: dict[str, tuple[str, int]] | None,
-                           compute_override: int | None) -> MemoryEstimate:
+                           compute_override: int | None, *, compute_bytes: int | None = None) -> MemoryEstimate:
     """The single memory estimate shared by the gate and the optimizer.
 
-    ``compute_override`` is llama.cpp's compute buffer at ubatch 512 and is
-    scaled to the actual ubatch.
+    ``compute_bytes`` is the compute buffer for exactly these settings (from a
+    :class:`~llama_autotune.memory.ComputeModel`). Otherwise
+    ``compute_override``, llama.cpp's compute buffer at ubatch 512, is scaled
+    to the actual ubatch.
     """
+    if compute_bytes is None and compute_override is not None:
+        compute_bytes = compute_override * ubatch // 512
     return estimate_memory(
         model, ctx, type_k=cache_type, type_v=cache_type, ubatch=ubatch, repack=repack,
-        isa_tier=isa_tier, tensor_sizes=tensor_sizes,
-        compute_override=None if compute_override is None else compute_override * ubatch // 512,
+        isa_tier=isa_tier, tensor_sizes=tensor_sizes, compute_override=compute_bytes,
     )
 
 
@@ -154,6 +172,8 @@ def _describe(key: str, value: object, saved: int) -> str:
         return f"ubatch {value} (saves {mib} MiB)"
     if key == "repack":
         return f"weight repacking off (saves {mib} MiB)"
+    if key == "flash_attn":
+        return f"flash attention on (saves {mib} MiB at this context)"
     return f"{value} KV cache with flash attention (saves {mib} MiB)"
 
 

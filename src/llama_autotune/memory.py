@@ -49,14 +49,26 @@ class MemoryEstimate:
     kv_cache: int = 0
     recurrent: int = 0
     compute: int = 0
+    runtime: int = 0
 
     @property
     def total(self) -> int:
-        return self.weights + self.repack_copy + self.kv_cache + self.recurrent + self.compute
+        return self.weights + self.repack_copy + self.kv_cache + self.recurrent + self.compute + self.runtime
 
     @property
     def total_mib(self) -> int:
         return round(self.total / MIB)
+
+
+def runtime_bytes(model: ModelInfo) -> int:
+    """Process memory llama.cpp's own breakdown does not list (tokenizer and the like).
+
+    Measured as working set minus llama.cpp's buffers on b12228: 11 MiB for
+    Llama 3.2 1B and 18 MiB for LFM3 (128K vocabularies), 45 MiB for Gemma 4
+    E2B and 85 MiB for Qwen3.5 2B (250K vocabularies). vocab x 384 bytes, at
+    least 32 MiB, covers all of them.
+    """
+    return max(32 * MIB, (model.vocab_size or 0) * 384)
 
 
 def kv_cache_bytes(layout: KVLayout, ctx: int, type_k: str = "f16", type_v: str = "f16", ubatch: int = 512) -> int:
@@ -151,6 +163,7 @@ def estimate_memory(
         kv_cache=kv_cache_bytes(layout, ctx, type_k, type_v, ubatch),
         recurrent=layout.recurrent_bytes,
         compute=compute_override if compute_override is not None else compute_buffer_bytes(model, ubatch),
+        runtime=runtime_bytes(model),
     )
 
 
@@ -164,11 +177,75 @@ def tensor_sizes_of(path: str) -> dict[str, tuple[str, int]]:
 _FIT_PRINT = re.compile(r"^\s*Host\s+(\d+)\s+(\d+)\s+(\d+)", re.MULTILINE)
 
 
+#: From this llama.cpp build on, llama-server reserves output logits for one
+#: token (``n_outputs_max = 1``), so its compute buffer is a few tens of MiB
+#: instead of vocab x ubatch x 4 bytes. Measured on b12228; older builds are
+#: treated like llama-bench, which is the safe side.
+SERVER_SINGLE_OUTPUT_BUILD = 12228
+
+
+@dataclass(frozen=True)
+class ComputeModel:
+    """llama.cpp's CPU compute buffer as a function of context and settings.
+
+    Built from one ``llama-fit-params`` answer (ctx 4,096, ubatch 512, flash
+    attention on) plus the model's shape, and checked against llama-server and
+    llama-fit-params on b12228 for five models, both flash-attention settings,
+    4K and 16K contexts (scratchpad experiment E1b; never below the measured
+    value, at most ~60 MiB above it):
+
+    * the **logits** buffer, vocab x outputs x 4 bytes: outputs = ubatch in
+      llama-bench and old servers, 1 in llama-server from b12228;
+    * a **core** working area, at most (fit-params value - logits) plus 16
+      rows of n_embd per ubatch token (60-85 MiB measured);
+    * with flash attention **off**, the attention scores, ctx x ubatch x
+      heads x 4 bytes. They grow with the context: 1,024 MiB for Llama 3.2
+      1B at 16K, where a fixed figure measured at 4K said 290 MiB.
+    """
+
+    base_on: int
+    vocab: int
+    n_embd: int
+    n_head: int
+    single_output: bool = False
+
+    def bytes(self, ctx: int, ubatch: int = 512, flash_attn: bool | None = None) -> int:
+        base = self.base_on * ubatch // 512
+        growth = max(0, ctx - 4096) * ubatch * 4  # mask and friends: +16 MiB at 16K for Llama 1B
+        logits = self.vocab * ubatch * 4
+        core = max(0, base - logits) + 16 * self.n_embd * ubatch * 4
+        scores = ctx * ubatch * self.n_head * 4 if flash_attn is False else 0
+        if self.single_output:
+            return core + self.vocab * 4 + (scores or growth)
+        if scores:
+            return max(base + growth, max(logits, scores) + core)
+        return base + growth
+
+
+def compute_model_for(model_path: str, model: ModelInfo, server_build: int = 0) -> ComputeModel | None:
+    """A :class:`ComputeModel` for this file, or None without ``llama-fit-params``.
+
+    Args:
+        model_path: GGUF path.
+        model: Its inspected metadata (vocabulary, width, heads).
+        server_build: The llama-server build the estimate is for; 0 for
+            llama-bench (tune), which always keeps logits for every token.
+    """
+    import os
+
+    st = os.stat(model_path)
+    base = _compute_at_4096(os.path.abspath(model_path), st.st_size, st.st_mtime_ns)
+    if base is None:
+        return None
+    return ComputeModel(base_on=base, vocab=model.vocab_size or 32_000, n_embd=model.n_embd or 4096,
+                        n_head=model.n_heads or 32, single_output=server_build >= SERVER_SINGLE_OUTPUT_BUILD)
+
+
 def compute_buffer_for(model_path: str, ctx: int) -> int | None:
     """Compute-buffer bytes at ubatch 512 from the installed ``llama-fit-params``.
 
     llama.cpp is asked once per model file, at 4,096 tokens. Beyond that the
-    attention mask grows by ``ubatch x 2`` bytes per context token, which
+    attention mask grows by ``ubatch x 4`` bytes per context token, which
     matched llama.cpp's own figures for Qwen3.5 4B up to 262,144 tokens; on
     other models the buffer grows less, so the estimate stays on the safe
     side.
@@ -183,7 +260,7 @@ def compute_buffer_for(model_path: str, ctx: int) -> int | None:
     base = _compute_at_4096(os.path.abspath(model_path), st.st_size, st.st_mtime_ns)
     if base is None:
         return None
-    return base + max(0, ctx - 4096) * 512 * 2
+    return base + max(0, ctx - 4096) * 512 * 4
 
 
 @functools.lru_cache(maxsize=16)
@@ -212,7 +289,7 @@ def llama_compute_buffer(fit_params_exe: str, model_path: str, ctx: int, ubatch:
     try:
         proc = subprocess.run(
             [fit_params_exe, "-m", model_path, "-c", str(ctx), "-ub", str(ubatch),
-             "--no-repack", "-fitp", "on"],
+             "--no-repack", "-fa", "on", "-fitp", "on"],
             capture_output=True, text=True, timeout=timeout, errors="replace",
             creationflags=_NO_WINDOW, env=clean_env(),
         )

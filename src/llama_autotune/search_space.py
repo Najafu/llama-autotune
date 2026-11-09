@@ -71,10 +71,13 @@ def _cpu_space(
 ) -> dict[str, ParamDef]:
     """Build the CPU-specific portion of the search space.
 
-    Threads range from one below the performance-core count up to every
-    logical thread of the performance cores: on a 2-core/4-thread i3, 3
-    threads generated 22% faster than llama.cpp's default of 2, so
-    hyper-threads must be reachable. Efficiency cores stay excluded.
+    Threads range up to every logical thread of the performance cores: on
+    a 2-core/4-thread i3, 3 threads generated 22% faster than llama.cpp's
+    default of 2, so hyper-threads must be reachable. Efficiency cores
+    stay excluded. On small CPUs the range starts one below the core
+    count; on CPUs with more than 6 performance cores it starts at a
+    quarter of them, because generation is limited by memory bandwidth
+    and often peaks well below the core count.
 
     Args:
         hw: Hardware information used to derive thread bounds.
@@ -89,7 +92,7 @@ def _cpu_space(
         high = max(hw.performance_threads, perf)
     else:
         high = max(hw.logical_cores, perf)
-    low = max(1, perf - 1)
+    low = max(1, perf - 1) if perf <= 6 else max(2, perf // 4)
     step = 1 if high - low <= 8 else 2
     return {"threads": ParamDef("threads", low, high, step=step)}
 

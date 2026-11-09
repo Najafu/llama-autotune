@@ -1,6 +1,6 @@
 [project]
 name = "llama-autotune"
-version = "0.4.0"
+version = "0.5.0"
 description = "Benchmarking and optimization tool for llama.cpp"
 readme = "README.md"
 license = {text = "MIT"}

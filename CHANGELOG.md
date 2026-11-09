@@ -5,6 +5,108 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-09
+
+Phase 2 (CPU tuning) of the next-generation design: measured tuning that
+finishes in bounded time, never recommends settings slower than llama.cpp's
+defaults, and answers in plain words.
+
+### Added
+
+- `tune` command: measures the fastest settings for a model on this PC in
+  at most 10 minutes (`--minutes`). It checks free memory, predicts the speed
+  from memory bandwidth, runs llama.cpp's defaults as the bar to beat, tests
+  threads, flash attention and weight repacking in one llama-bench process,
+  and re-tests the best third with three repetitions (successive halving).
+  It then picks prompt threads and ubatch, measures the speed after 2,048
+  tokens of chat, and lets the winner and the defaults take turns in a final
+  duel, so a program starting halfway cannot decide the result. The
+  protocol is documented in `docs/benchmark-protocol.md`.
+- Plain verdicts: Fast (10 tokens/s or more), Usable (4 to 10), Slow, or
+  Won't fit, each with one reason.
+- `launch` applies the settings saved by `tune` for that model and machine,
+  and warns when llama.cpp was upgraded since.
+- `launch --editing` turns on n-gram speculative decoding
+  (`--spec-type ngram-mod`): 1.7 to 2.6 times faster when rewriting pasted
+  text, and about 7% slower on new text, so it is off by default.
+- Speed prediction: efficiency x bandwidth / bytes read per token, including
+  the KV cache at a given depth. The efficiency is calibrated per model.
+- One-process llama-bench sweeps (`run_sweep`): comma lists, JSONL
+  records, and results finished before a watchdog stop are kept.
+- NUMA node count in `doctor`. On multi-socket PCs, `tune` also tests
+  `--numa distribute`.
+- Above-normal priority for `tune` measurements and for `launch`
+  (`--prio 1 --prio-batch 1`): +13% and much steadier speed while other
+  programs keep half the CPU busy. High priority gave nothing more.
+
+### Fixed
+
+Found by experiments on the test PC (details in `docs/benchmark-protocol.md`):
+
+- The memory check could underestimate long contexts with flash attention off
+  by about 800 MiB (Llama 3.2 1B at 16K: llama.cpp needs 1,082 MiB of
+  compute buffer, the estimate said 290). The compute buffer is now modelled
+  from logits, a core area and attention scores that grow with the context,
+  and never fell below llama.cpp's figure in 28 checks. When such a context
+  does not fit, turning flash attention back on is tried before cutting the
+  context.
+- `launch` and `inspect` overestimated llama-server's memory by 190 to 450 MiB
+  on b12228, which reserves output logits for one token only. On the 8 GB test
+  PC this decided whether a model could start (Llama 3.2 1B was refused, short
+  by 51 MiB). Estimates now land 40 to 70 MiB above the measured working set.
+- A small runtime allowance (tokenizer and the like, 11 to 85 MiB measured) is
+  now part of the estimate.
+- The memory-speed test ran while other programs competed for memory, so a
+  busy PC measured 12.8 instead of 18 GB/s and reported an impossible 121%
+  efficiency. `tune` now uses the best bandwidth ever measured on this PC.
+- The flash-attention choice compared speeds from two different measurements
+  and could keep it on (7.0 instead of 10.3 tokens/s after 2,048 tokens of
+  chat). Each setting now scores its empty-chat and long-chat speed together,
+  from like-for-like measurements.
+- On a busy PC the final check against the defaults could reach the wrong
+  verdict (the same +8-21% gain measured as -3% when a program started
+  halfway). Winner and defaults now take turns, judged by the median of paired
+  ratios.
+
+Found by testing on llama.cpp b12228 (0.9.0-dev):
+
+- Flash attention was chosen from an empty context only. On b12228 it ties
+  there on the test PC but is 37% slower after 2,048 tokens of chat, and
+  llama.cpp's "auto" turns it on, so the tuned Llama 3.2 1B wrote only
+  6.4 tokens/s in a longer chat. `tune` now also compares it after a long
+  chat (11.0 tokens/s), and sets that time aside before the ubatch test.
+- `launch` ignored a setting that `tune` had kept at llama.cpp's default and
+  used its own guess instead (flash attention off instead of auto). It now
+  uses exactly what was measured.
+- When the defaults won for writing, `tune` also discarded a faster prompt
+  batch size it had just measured (+29% on prompts), while still reporting it.
+- LFM2/LFM3 short-convolution state was missing from the memory estimate
+  (0.61 MiB for LFM3 1.7B; KV cache and repacking already matched llama.cpp).
+
+Found earlier:
+
+- A model whose architecture is newer than the installed llama.cpp (for
+  example LFM3 on b11347) made `tune` fail with "Tuning failed (failed)"
+  after measuring memory speed, and `inspect` said it fits. Every command now
+  checks the model type against the architecture table inside the installed
+  llama.cpp library before doing anything, and says plainly to update
+  llama.cpp and where to get it.
+- Windows PCs with more than 64 logical processors: threads outside
+  processor group 0 were not counted.
+- Thread search on many-core CPUs started at the core count minus one, so it
+  never tried the lower counts where bandwidth-bound generation often peaks.
+  It now spreads from a quarter of the performance cores and refines around
+  the best.
+- Memory bandwidth was measured with one thread, which cannot saturate
+  workstation and server memory. It now also measures with one thread per
+  performance core and reports the higher figure.
+
+### Changed
+
+- `search` is now described as the advanced option for GPUs and experiments;
+  `tune` is the default for CPUs.
+- Tests no longer touch the user's real database.
+
 ## [0.4.0] - 2026-11-07
 
 Phase 1 (Foundation) of the next-generation design: correct and memory-safe

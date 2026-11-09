@@ -416,6 +416,11 @@ def kv_layout(kv: dict, arch: str) -> KVLayout:
         n_group = _get_int(kv, f"{arch}.ssm.group_count", 0)
         per_layer = 4 * (d_inner * d_state + (d_conv - 1) * (d_inner + 2 * n_group * d_state))
         layout.recurrent_bytes = recurrent_layers * per_layer
+    l_cache = _get_int(kv, f"{arch}.shortconv.l_cache", 0)
+    if recurrent_layers and l_cache > 1 and not layout.recurrent_bytes:
+        # LFM2/LFM3 short-convolution layers keep (l_cache - 1) f32 columns of
+        # n_embd each (0.61 MiB for LFM3 1.7B, as llama.cpp b12228 reports).
+        layout.recurrent_bytes = recurrent_layers * 4 * (l_cache - 1) * n_embd
     return layout
 
 
