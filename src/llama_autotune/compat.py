@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 import os
 import re
 import shutil
@@ -48,6 +49,11 @@ def config_path() -> Path:
     return Path.home() / ".llama-autotune" / "config.json"
 
 
+def cache_dir() -> Path:
+    """``~/.llama-autotune/cache``: answers from llama.cpp that are slow to ask for again."""
+    return Path.home() / ".llama-autotune" / "cache"
+
+
 def saved_llama_dir() -> str:
     """The llama.cpp folder saved by ``llama-autotune setup``, or ``""``."""
     try:
@@ -77,12 +83,14 @@ def common_llama_dirs() -> list[Path]:
     """Folders where beginners usually unzip llama.cpp, newest download first.
 
     The official Windows zips are named like ``llama-b12228-bin-win-cpu-x64``;
-    when several sit in Downloads, the highest build number wins.
+    when several sit in Downloads, the highest build number wins. The current
+    folder is not searched: a program that happens to be named llama-bench in
+    a folder someone else packed must not be run just because we stand in it.
     """
     home = Path.home()
-    fixed = [Path.cwd(), Path("C:/llama"), Path("C:/llama.cpp"), Path("C:/llamacpp"),
+    fixed = [Path("C:/llama"), Path("C:/llama.cpp"), Path("C:/llamacpp"),
              home / "llama", home / "llama.cpp", home / "llamacpp"] if os.name == "nt" else \
-            [Path.cwd(), home / "llama.cpp", home / "llama.cpp" / "build" / "bin", Path("/opt/llama.cpp")]
+            [home / "llama.cpp", home / "llama.cpp" / "build" / "bin", Path("/opt/llama.cpp")]
     downloads = sorted((p for p in (home / "Downloads").glob("llama-*bin-*") if p.is_dir()),
                        key=_build_in_name, reverse=True) if (home / "Downloads").is_dir() else []
     return fixed + downloads
@@ -94,7 +102,7 @@ def find_llama_binary(base: str) -> str:
     Looks in this order: the ``LLAMA_CPP_DIR`` environment variable, the
     folder saved by ``llama-autotune setup``, folders next to the package,
     the system ``PATH``, and finally common unzip locations (``C:\\llama``,
-    the current folder, Downloads).
+    Downloads).
 
     Args:
         base: Base tool name, e.g. ``"llama-bench"`` or ``"llama-server"``.
@@ -335,7 +343,7 @@ def _cache_path(paths: list[str]) -> Path:
             key.update(f"{os.path.abspath(p)}|{st.st_size}|{st.st_mtime_ns}".encode())
         except OSError:
             key.update(p.encode())
-    return Path.home() / ".llama-autotune" / "cache" / f"compat-{key.hexdigest()[:16]}.json"
+    return cache_dir() / f"compat-{key.hexdigest()[:16]}.json"
 
 
 def detect_capabilities(use_cache: bool = True) -> Capabilities:
@@ -438,13 +446,13 @@ def architecture_supported(caps: Capabilities, arch: str) -> bool | None:
     sentinel = b"\0" + _SENTINEL_ARCH.encode() + b"\0"
     table_seen = False
     for path in _library_candidates(caps):
-        try:
-            data = path.read_bytes()
-        except OSError:
+        try:  # mapped, not read: a GPU build's library runs to hundreds of megabytes
+            with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                if data.find(needle) != -1:
+                    return True
+                table_seen = table_seen or data.find(sentinel) != -1
+        except (OSError, ValueError):  # unreadable, or empty (cannot be mapped)
             continue
-        if needle in data:
-            return True
-        table_seen = table_seen or sentinel in data
     return False if table_seen else None
 
 
@@ -640,6 +648,31 @@ def render_args(config: "SearchConfig", tool: str, registry: FlagRegistry | None
         else:
             result.skipped.append(f"{name}={_enum_value(raw)}: this llama.cpp build has no matching flag")
     return result
+
+
+# ── launch profiles from other people ────────────────────────────────
+
+#: The llama-server options llama-autotune itself writes into a profile. A
+#: profile file may come from anywhere; anything else in it (a network
+#: address, a file to write, a model to download) is refused.
+PROFILE_FLAGS = frozenset({
+    "-t", "-tb", "-c", "-b", "-ub", "-ngl", "-fa", "-ts", "-sm", "-mg", "-ctk", "-ctv", "-lm", "--no-mmap",
+    "--mlock", "--direct-io", "--repack", "--no-repack", "--numa", "-C", "-np", "-nkvo", "-ncmoe", "-cram",
+    "-ctxcp", "--no-mmproj", "--spec-type", "--prio", "--prio-batch",
+})
+_FLAG_WORD = re.compile(r"^-{1,2}[A-Za-z]")
+
+
+def foreign_profile_flags(args: list[str], registry: FlagRegistry | None = None) -> list[str]:
+    """Options in a profile's arguments that llama-autotune would never write."""
+    foreign = []
+    for word in args:
+        if not _FLAG_WORD.match(word):
+            continue
+        spec = registry.get(word) if registry else None
+        if not PROFILE_FLAGS.intersection(spec.names if spec else [word]):
+            foreign.append(word)
+    return foreign
 
 
 # ── environment hygiene ──────────────────────────────────────────────

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .models import BenchmarkEntry, LaunchProfile, SearchConfig
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS benchmarks (
@@ -71,6 +71,9 @@ _ADDED_COLUMNS = [
     ("benchmarks", "min_available_mb", "REAL DEFAULT 0"),
     ("benchmarks", "error", "TEXT DEFAULT ''"),
     ("launch_profiles", "llama_build", "INTEGER DEFAULT 0"),
+    ("tuned_settings", "depth_tps", "REAL DEFAULT 0"),
+    ("tuned_settings", "depth", "INTEGER DEFAULT 0"),
+    ("tuned_settings", "verdict", "TEXT DEFAULT ''"),
 ]
 
 
@@ -107,6 +110,15 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 get_session = connect
+
+
+def adopt_hardware_id(conn: sqlite3.Connection, old_id: str, new_id: str) -> None:
+    """Move results stored under an earlier id of this machine to its current id."""
+    if not old_id or old_id == new_id:
+        return
+    for table in ("benchmarks", "tuned_settings"):
+        conn.execute(f"UPDATE {table} SET hardware_id = ? WHERE hardware_id = ?", (new_id, old_id))
+    conn.commit()
 
 
 def save_benchmark(conn: sqlite3.Connection, entry: BenchmarkEntry) -> None:
@@ -197,17 +209,23 @@ class TunedSettings:
     bandwidth_gbs: float = 0.0
     model_path: str = ""
     timestamp: str = ""
+    depth_tps: float = 0.0  # writing speed after `depth` tokens of chat
+    depth: int = 0
+    verdict: str = ""
+    model_id: str = ""
 
 
 def save_tuned(conn: sqlite3.Connection, hardware_id: str, model_id: str, tuned: TunedSettings) -> None:
     """Store the result of a tuning run; the newest one per machine and model is used."""
     conn.execute(
         """INSERT INTO tuned_settings (hardware_id, model_id, llama_build, config_json, generation_tps,
-               prompt_tps, baseline_tps, ctx, efficiency, bandwidth_gbs, model_path, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               prompt_tps, baseline_tps, ctx, efficiency, bandwidth_gbs, model_path, timestamp,
+               depth_tps, depth, verdict)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (hardware_id, model_id, tuned.llama_build, tuned.config.model_dump_json(exclude_none=True),
          tuned.generation_tps, tuned.prompt_tps, tuned.baseline_tps, tuned.ctx, tuned.efficiency,
-         tuned.bandwidth_gbs, tuned.model_path, tuned.timestamp or datetime.now(timezone.utc).isoformat()),
+         tuned.bandwidth_gbs, tuned.model_path, tuned.timestamp or datetime.now(timezone.utc).isoformat(),
+         tuned.depth_tps, tuned.depth, tuned.verdict),
     )
     conn.commit()
 
@@ -229,15 +247,30 @@ def get_tuned(conn: sqlite3.Connection, hardware_id: str, model_id: str) -> Tune
         "SELECT * FROM tuned_settings WHERE hardware_id = ? AND model_id = ? ORDER BY id DESC LIMIT 1",
         (hardware_id, model_id),
     ).fetchone()
-    if row is None:
-        return None
+    return None if row is None else _tuned_from_row(row)
+
+
+def _tuned_from_row(row: sqlite3.Row) -> TunedSettings:
     return TunedSettings(
         config=SearchConfig.model_validate_json(row["config_json"] or "{}"), llama_build=row["llama_build"] or 0,
         generation_tps=row["generation_tps"] or 0.0, prompt_tps=row["prompt_tps"] or 0.0,
         baseline_tps=row["baseline_tps"] or 0.0, ctx=row["ctx"] or 0, efficiency=row["efficiency"] or 0.0,
         bandwidth_gbs=row["bandwidth_gbs"] or 0.0, model_path=row["model_path"] or "",
         timestamp=row["timestamp"] or "",
+        depth_tps=row["depth_tps"] or 0.0, depth=row["depth"] or 0, verdict=row["verdict"] or "",
+        model_id=row["model_id"] or "",
     )
+
+
+def list_tuned(conn: sqlite3.Connection, hardware_id: str) -> list[TunedSettings]:
+    """The newest tuning result of every model tuned on this machine, fastest first."""
+    rows = conn.execute(
+        """SELECT * FROM tuned_settings WHERE id IN (
+               SELECT MAX(id) FROM tuned_settings WHERE hardware_id = ? GROUP BY model_id)
+           ORDER BY generation_tps DESC""",
+        (hardware_id,),
+    ).fetchall()
+    return [_tuned_from_row(r) for r in rows]
 
 
 # ── llama-server options the user set for a model (launch --temp 0.1 ...) ──

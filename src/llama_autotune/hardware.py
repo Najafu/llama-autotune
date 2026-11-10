@@ -66,7 +66,17 @@ def detect_hardware(caps: Capabilities | None = None, probe_llama: bool = True) 
 
 
 def hardware_fingerprint(hw: HardwareInfo) -> str:
-    """Stable id for a machine: CPU, total RAM, GPUs and OS."""
+    """Stable id for a machine: CPU, total RAM, GPUs and operating system family.
+
+    The OS release is left out on purpose: it changes with every Linux kernel
+    update and with a Windows upgrade, and the hardware is still the same.
+    """
+    data = json.dumps([hw.cpu_name, round(hw.ram_gb), sorted(hw.gpu_models), platform.system()])
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+def legacy_hardware_fingerprint(hw: HardwareInfo) -> str:
+    """The id used up to v0.5.0 (it included the OS release), to adopt old results."""
     data = json.dumps([hw.cpu_name, round(hw.ram_gb), sorted(hw.gpu_models), platform.system(), platform.release()])
     return hashlib.sha256(data.encode()).hexdigest()[:16]
 

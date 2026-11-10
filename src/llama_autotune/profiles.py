@@ -44,7 +44,7 @@ def export_profile(profile: LaunchProfile, path: str | None = None) -> str:
         os.makedirs(profiles_dir, exist_ok=True)
         path = os.path.join(profiles_dir, f"{profile.name}.json")
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(profile.model_dump(), f, indent=2)
     return path
 
@@ -57,10 +57,16 @@ def import_profile(path: str) -> LaunchProfile:
 
     Returns:
         The deserialised ``LaunchProfile``.
+
+    Raises:
+        ValueError: The file is not a llama-autotune profile.
+        OSError: The file cannot be read.
     """
-    with open(path) as f:
-        data = json.load(f)
-    return LaunchProfile(**data)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return LaunchProfile(**json.load(f))
+    except (TypeError, ValueError) as e:  # not JSON, not an object, or the wrong fields
+        raise ValueError(f"{os.path.basename(path)} is not a llama-autotune profile") from e
 
 
 def create_profile(

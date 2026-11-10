@@ -150,19 +150,3 @@ def to_cpu_config(config: SearchConfig) -> SearchConfig:
     cfg.n_gpu_layers = 0
     cfg.flash_attn = False
     return cfg
-
-
-def apply_search_config(hw: HardwareInfo, model: ModelInfo, base: SearchConfig) -> SearchConfig:
-    """Return a copy of *base* with hardware-adjusted thread count applied.
-
-    Args:
-        hw: Hardware information used to cap thread count.
-        model: Model metadata (currently unused but reserved).
-        base: The base configuration to clone and adjust.
-
-    Returns:
-        A new SearchConfig with threads clamped to available logical/physical cores.
-    """
-    cfg = base.model_copy()
-    cfg.threads = max(1, min(hw.logical_cores, hw.physical_cores))
-    return cfg

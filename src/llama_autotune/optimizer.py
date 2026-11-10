@@ -8,15 +8,19 @@ batch_size, ubatch_size, n_gpu_layers) one at a time, keeping the best so far.
 
 Stage C — Bayesian optimisation: use Optuna's TPE sampler to explore the full
 search space around the best config found by the earlier stages.
+
+Finally the winner and the baseline take turns once more; the winner is kept
+only when it still leads by more than the measurement noise, because the best
+of many single noisy measurements is partly luck.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
-from typing import Any
-
-import optuna
+from statistics import mean
+from typing import TYPE_CHECKING, Any
 
 from .benchmark import run_benchmark
 from .compat import detect_capabilities
@@ -36,7 +40,13 @@ from .models import (
 )
 from .search_space import ParamDef, config_from_params, get_search_space
 
+if TYPE_CHECKING:  # optuna takes over half a second to import; only stage C needs it
+    import optuna
+
 logger = logging.getLogger(__name__)
+
+#: A searched configuration replaces the baseline only when it wins by more than this.
+CONFIRM_MARGIN = 0.04
 
 class Optimizer:
     """Three-stage parameter optimizer for llama.cpp.
@@ -99,6 +109,7 @@ class Optimizer:
             )
             self._initial_config = self.gate.apply(self._initial_config)
         self._best_config: SearchConfig | None = None
+        self._baseline_config: SearchConfig | None = None
         self._best_score: float = 0.0
         self._total_evals: int = 0
         self._cache: dict[str, BenchmarkResult] = {}
@@ -113,19 +124,20 @@ class Optimizer:
         """Run a minimal benchmark to determine hardware speed tier.
 
         Uses a small prompt (16 tokens) and short generation (8 tokens)
-        with a single repetition, no warmup, and a 30-second timeout.
-        Based on the measured generation throughput the method sets
+        with a single repetition and no warmup. The time limit allows for
+        loading the model from a slow disk (15 s per GB on top of a minute),
+        so a large file is not mistaken for a slow CPU. Based on the measured generation throughput the method sets
         ``_speed_tier``, ``_n_prompt``, ``_n_gen``, and ``_bench_reps``
         so that subsequent evaluations are scaled to the hardware.
         """
         cfg = self._initial_config.model_copy()
         result = run_benchmark(self.model_path, cfg,
-                               repetitions=1, timeout=30,
+                               repetitions=1, timeout=60 + int(15 * self.model.file_size_gb),
                                n_prompt=16, n_gen=8, no_warmup=True,
                                registry=self.caps.bench)
         if not result.success:
-            self._speed_tier = "very_slow"
-            logger.info("Speed probe failed — tier: very_slow")
+            self._speed_tier = "very_slow" if result.error == "timeout" else "failed"
+            logger.warning(f"Speed probe failed ({result.error or 'no result'}) — tier: {self._speed_tier}")
             return
 
         tps = result.generation_tps
@@ -160,8 +172,9 @@ class Optimizer:
             return self._initial_config
 
         self._estimate_speed()
-        if self._speed_tier == "very_slow":
-            logger.warning("Hardware too slow for benchmarking — using heuristic")
+        if self._speed_tier in ("very_slow", "failed"):
+            logger.warning("Hardware too slow for benchmarking — using heuristic" if self._speed_tier == "very_slow"
+                           else "llama-bench could not run this model — using heuristic")
             self._n_prompt, self._n_gen, self._bench_reps = 64, 32, 1
             return self._initial_config
 
@@ -171,6 +184,7 @@ class Optimizer:
 
         if self._best_config is not None:
             self._stage_c_bayesian()
+        self._confirm_winner()
 
         logger.info(f"Optimization complete — best_score={self._best_score} total_evals={self._total_evals}")
         return self._best_config or self._initial_config
@@ -184,7 +198,7 @@ class Optimizer:
         logger.info("Stage A: rule-based baseline")
         result = self._evaluate(self._initial_config)
         if result.success:
-            self._best_config = self._initial_config
+            self._best_config = self._baseline_config = self._initial_config
             self._best_score = self._score(result, self._initial_config)
             logger.info(f"Baseline score={self._best_score} gen_tps={result.generation_tps} prompt_tps={result.prompt_tps}")
         else:
@@ -275,6 +289,8 @@ class Optimizer:
         Evaluates up to ``n_trials_stage_c`` configs and updates the best
         config if the study finds a superior score.
         """
+        import optuna
+
         logger.info("Stage C: Bayesian optimization")
         space = get_search_space(self.hw, self.model, self.objective)
 
@@ -311,6 +327,40 @@ class Optimizer:
             self._best_score = best_value
             logger.info(f"Bayesian improved (score={self._best_score})")
 
+    def _confirm_winner(self) -> None:
+        """Re-measure the winner against the baseline, taking turns.
+
+        The search keeps the best of many single measurements, and the best
+        of many noisy numbers is partly luck. Two alternating rounds expose
+        both to the same disturbances; the winner stays only when its mean
+        score still leads by more than :data:`CONFIRM_MARGIN`.
+        """
+        base, best = self._baseline_config, self._best_config
+        if base is None or best is None or best == base:
+            return
+        logger.info("Confirming the best config against the baseline")
+        scores: dict[str, list[float]] = {"base": [], "best": []}
+        for _ in range(2):
+            for name, cfg in (("base", base), ("best", best)):
+                result = self.measure(cfg)
+                if result.success:
+                    scores[name].append(self._score(result, cfg))
+        if not scores["base"] or not scores["best"]:
+            return
+        base_score, best_score = mean(scores["base"]), mean(scores["best"])
+        if best_score - base_score > CONFIRM_MARGIN * abs(base_score):
+            self._best_score = best_score
+        else:
+            logger.warning(f"The searched config did not hold up when re-measured "
+                           f"({best_score:.2f} vs {base_score:.2f}): keeping the baseline")
+            self._best_config, self._best_score = base, base_score
+
+    def measure(self, config: SearchConfig) -> BenchmarkResult:
+        """One fresh benchmark of ``config`` at this machine's test sizes (not cached)."""
+        return run_benchmark(self.model_path, config, timeout=900,
+                             n_prompt=self._n_prompt, n_gen=self._n_gen,
+                             repetitions=self._bench_reps, registry=self.caps.bench)
+
     def _evaluate(self, config: SearchConfig) -> BenchmarkResult:
         """Run a benchmark for the given config, caching the result.
 
@@ -329,9 +379,7 @@ class Optimizer:
 
         self._total_evals += 1
         for attempt in range(2):
-            result = run_benchmark(self.model_path, config, timeout=900,
-                                   n_prompt=self._n_prompt, n_gen=self._n_gen,
-                                   repetitions=self._bench_reps, registry=self.caps.bench)
+            result = self.measure(config)
             if result.error != "memory_guard_external" or attempt:
                 break
             logger.warning("Another program used RAM during the benchmark; retrying in 10 s")
@@ -345,57 +393,47 @@ class Optimizer:
         return result
 
     def _score(self, result: BenchmarkResult, config: SearchConfig) -> float:
-        """Compute a scalar score from a benchmark result based on the objective.
+        """Compute a scalar score (higher is better) for the objective.
 
-        For ``MAX_CONTEXT`` the score is dominated by the configured context
-        size (feasibility is enforced by the constraint engine and benchmark
-        success), with generation throughput as a tiebreaker.
-
-        Args:
-            result: The benchmark result to score.
-            config: The configuration that produced the result.
-
-        Returns:
-            A numerical score (higher is better).
+        * ``max_generation_tps``: writing speed.
+        * ``max_prompt_tps``: prompt reading speed.
+        * ``balanced``: geometric mean of both, so neither is traded away.
+        * ``min_latency``: minus the seconds until the first word appears for
+          the test prompt (reading it, then one token).
+        * ``max_efficiency``: writing speed per MiB of peak memory.
+        * ``max_context``: writing speed. llama-bench cannot measure a context
+          size, so the context is decided by the memory gate (``launch -c
+          max``), not searched.
         """
-        if self.objective == OptimizeObjective.MAX_GENERATION_TPS:
-            return result.generation_tps
-        elif self.objective == OptimizeObjective.MAX_PROMPT_TPS:
-            return result.prompt_tps
-        elif self.objective == OptimizeObjective.MIN_LATENCY:
+        gen, prompt = result.generation_tps, result.prompt_tps
+        if self.objective == OptimizeObjective.MAX_PROMPT_TPS:
+            return prompt
+        if self.objective == OptimizeObjective.MIN_LATENCY:
+            if gen > 0 and prompt > 0:
+                return -(self._n_prompt / prompt + 1 / gen)
             return -result.startup_time
-        elif self.objective == OptimizeObjective.MAX_EFFICIENCY:
-            return result.generation_tps / max(result.memory_usage, 1)
-        elif self.objective == OptimizeObjective.MAX_CONTEXT:
-            return float(config.ctx_size or 0) + result.generation_tps / 1000.0
-        else:
-            return result.generation_tps
+        if self.objective == OptimizeObjective.MAX_EFFICIENCY:
+            return gen / max(result.memory_usage, 1)
+        if self.objective == OptimizeObjective.BALANCED and gen > 0 and prompt > 0:
+            return math.sqrt(gen * prompt)
+        return gen
 
     def _grid_values(self, param: ParamDef, count: int) -> list[Any]:
-        """Generate up to ``count`` evenly-spaced values for a parameter.
+        """Up to ``count`` values spread evenly over the whole range of a parameter.
 
-        For categorical parameters the first ``count`` categories are
-        returned.  For numeric parameters with a step size the values are
-        produced by repeated addition; otherwise a uniform step is computed.
-
-        Args:
-            param: The parameter definition.
-            count: Maximum number of values to return.
-
-        Returns:
-            A list of parameter values to evaluate.
+        Categorical parameters return their first ``count`` categories.
+        Numeric values are snapped to the parameter's step, so the lowest and
+        the highest value of the range are always tried.
         """
         if param.is_categorical and param.categories:
             return param.categories[:count]
-        if param.step:
-            values = []
-            v = param.low
-            while v <= param.high and len(values) < count:
-                values.append(int(v) if isinstance(param.low, int) else v)
-                v += param.step
-            return values
-        step = max(1, (param.high - param.low) // (count - 1))
-        return list(range(param.low, param.high + 1, step))
+        low, high = int(param.low), int(param.high)
+        step = int(param.step or 1)
+        n_steps = max(0, (high - low) // step)
+        picks = min(count, n_steps + 1)
+        if picks <= 1:
+            return [low]
+        return sorted({low + round(i * n_steps / (picks - 1)) * step for i in range(picks)})
 
     def _sample_param(
         self, trial: optuna.Trial, name: str, pdef: ParamDef
