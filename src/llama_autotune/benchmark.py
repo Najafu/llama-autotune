@@ -24,7 +24,7 @@ from .compat import FlagRegistry, binary_name, clean_env, find_llama_binary, ren
 from .models import BenchmarkResult, SearchConfig
 
 __all__ = ["BenchRecord", "SweepResult", "binary_name", "find_llama_binary", "find_llama_bench",
-           "parse_records", "run_benchmark", "run_sweep"]
+           "parse_records", "run_benchmark", "run_sweep", "summarize"]
 
 DEFAULT_MIN_AVAILABLE_MIB = 400
 
@@ -78,7 +78,7 @@ def run_benchmark(
     """
     result = BenchmarkResult()
     bench_path = find_llama_bench()
-    cmd = [bench_path, "-m", str(model_path), "-r", str(repetitions), "-o", "json",
+    cmd = [bench_path, "-m", str(model_path), "-r", str(repetitions), "-o", "jsonl",
            "-p", str(n_prompt), "-n", str(n_gen)]
     if n_depth:
         cmd += ["-d", str(n_depth)]
@@ -96,16 +96,24 @@ def run_benchmark(
         result.error = run.error
         result.raw_output = run.detail
         return result
-    stdout = run.stdout
-
-    parsed = _parse_benchmark_output(stdout)
-    if parsed:
-        result.prompt_tps = parsed.get("prompt_tps", 0.0)
-        result.generation_tps = parsed.get("generation_tps", 0.0)
+    records = parse_records(run.stdout)
+    if records:
+        result.prompt_tps, result.generation_tps = summarize(records)
         result.success = True
     else:
         result.error = "failed"
     return result
+
+
+def summarize(records: list[BenchRecord]) -> tuple[float, float]:
+    """``(prompt, generation)`` tokens per second of one llama-bench run.
+
+    A test that generates counts as generation (also the combined prompt and
+    generation test of older builds); a prompt-only test counts as prompt.
+    """
+    prompt = max((r.avg_ts for r in records if r.kind == "pp"), default=0.0)
+    generation = max((r.avg_ts for r in records if r.kind != "pp"), default=0.0)
+    return prompt, generation
 
 
 @dataclass
@@ -133,13 +141,23 @@ def _execute(cmd: list[str], timeout: float, min_available_mib: int) -> _Run:
     try:
         with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as out, \
              tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
-            start = time.time()
+            start = time.monotonic()
             proc = subprocess.Popen(
                 cmd, stdout=out, stderr=err, env=clean_env(),
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            watch = watch_process(proc, timeout, min_available_mib)
-            run.elapsed = time.time() - start
+            try:
+                watch = watch_process(proc, timeout, min_available_mib)
+            finally:
+                # Ctrl+C lands here: on Windows the hidden llama-bench never sees it
+                # and would keep running at raised priority after we are gone.
+                if proc.poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        pass
+            run.elapsed = time.monotonic() - start
             out.seek(0)
             err.seek(0)
             run.stdout, run.stderr = out.read(), err.read()
@@ -366,7 +384,7 @@ def watch_process(proc: subprocess.Popen, timeout: float, min_available_mib: int
         ps = psutil.Process(proc.pid)
     except psutil.Error:
         ps = None
-    start = time.time()
+    start = time.monotonic()
     start_avail = psutil.virtual_memory().available
     low = start_avail
     peak = 0
@@ -374,7 +392,7 @@ def watch_process(proc: subprocess.Popen, timeout: float, min_available_mib: int
     polls = 0
 
     while proc.poll() is None:
-        if time.time() - start > timeout:
+        if time.monotonic() - start > timeout:
             report.stopped_by, report.detail = "timeout", f"no result after {timeout:.0f} s"
             break
         rss = 0
@@ -412,80 +430,3 @@ def watch_process(proc: subprocess.Popen, timeout: float, min_available_mib: int
     report.peak_rss_mib = round(peak / mib, 1)
     report.min_available_mib = round(low / mib, 1)
     return report
-
-
-def _parse_benchmark_output(output: str) -> dict | None:
-    """Parse the JSON output from llama-bench into a flat dictionary.
-
-    Handles JSON arrays, single JSON objects, and JSONL (one object per
-    line).  Works with both the current llama-bench format (using
-    ``avg_ts``) and legacy format (``pp_avg`` / ``tg_avg``).
-
-    When ``--no-warmup`` is used, llama-bench outputs two entries: a
-    prompt-processing entry (``n_gen=0``) and a generation entry
-    (``n_gen>0``).  The function identifies each by the ``n_gen`` field.
-
-    Args:
-        output: The raw stdout text from llama-bench.
-
-    Returns:
-        A dictionary with keys ``prompt_tps``, ``generation_tps``, and
-        ``memory_usage``, or ``None`` if no valid data could be
-        extracted.
-    """
-    entries: list[dict] = []
-
-    # Try top-level JSON parse first (array or single object)
-    try:
-        data = json.loads(output)
-        if isinstance(data, list):
-            entries = data
-        elif isinstance(data, dict):
-            entries = [data]
-    except (json.JSONDecodeError, ValueError, TypeError):
-        # Fall back to line-by-line JSONL
-        for line in output.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-                if isinstance(d, dict):
-                    entries.append(d)
-            except (json.JSONDecodeError, ValueError, TypeError):
-                continue
-
-    if not entries:
-        return None
-
-    prompt_tps = 0.0
-    gen_tps = 0.0
-    memory = 0.0
-    is_split = len(entries) > 1
-
-    for entry in entries:
-        n_gen = entry.get("n_gen", 0)
-        n_prompt = entry.get("n_prompt", 0)
-        avg_ts = entry.get("avg_ts")
-
-        if avg_ts is not None:
-            ftps = float(avg_ts)
-            if n_gen and n_gen > 0:
-                gen_tps = ftps
-            elif n_prompt and n_prompt > 0 and is_split:
-                prompt_tps = ftps
-            elif not is_split:
-                gen_tps = ftps
-
-        prompt_tps = max(prompt_tps,
-                         float(entry.get("pp_avg", entry.get("prompt_tps", 0))))
-        gen_tps = max(gen_tps,
-                      float(entry.get("tg_avg", entry.get("generation_tps", 0))))
-        memory = max(memory,
-                     float(entry.get("mem_usage", entry.get("memory_usage", 0))))
-
-    return {
-        "prompt_tps": prompt_tps,
-        "generation_tps": gen_tps,
-        "memory_usage": memory,
-    }

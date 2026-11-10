@@ -14,6 +14,8 @@ The estimate is built from parts measured against llama.cpp b11347:
 from __future__ import annotations
 
 import functools
+import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -233,8 +235,6 @@ def compute_model_for(model_path: str, model: ModelInfo, server_build: int = 0) 
         server_build: The llama-server build the estimate is for; 0 for
             llama-bench (tune), which always keeps logits for every token.
     """
-    import os
-
     st = os.stat(model_path)
     base = _compute_at_4096(os.path.abspath(model_path), st.st_size, st.st_mtime_ns)
     if base is None:
@@ -243,38 +243,52 @@ def compute_model_for(model_path: str, model: ModelInfo, server_build: int = 0) 
                         n_head=model.n_heads or 32, single_output=server_build >= SERVER_SINGLE_OUTPUT_BUILD)
 
 
-def compute_buffer_for(model_path: str, ctx: int) -> int | None:
-    """Compute-buffer bytes at ubatch 512 from the installed ``llama-fit-params``.
-
-    llama.cpp is asked once per model file, at 4,096 tokens. Beyond that the
-    attention mask grows by ``ubatch x 4`` bytes per context token, which
-    matched llama.cpp's own figures for Qwen3.5 4B up to 262,144 tokens; on
-    other models the buffer grows less, so the estimate stays on the safe
-    side.
-
-    Returns:
-        Bytes, or None when the tool is not installed or fails, so callers
-        fall back to :func:`compute_buffer_bytes`.
-    """
-    import os
-
-    st = os.stat(model_path)
-    base = _compute_at_4096(os.path.abspath(model_path), st.st_size, st.st_mtime_ns)
-    if base is None:
-        return None
-    return base + max(0, ctx - 4096) * 512 * 4
+_COMPUTE_CACHE_ENTRIES = 200
 
 
-@functools.lru_cache(maxsize=16)
+def _compute_cache_file():
+    from .compat import cache_dir
+
+    return cache_dir() / "compute-buffers.json"
+
+
+def _load_compute_cache() -> dict[str, int]:
+    try:
+        data = json.loads(_compute_cache_file().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+@functools.lru_cache(maxsize=64)
 def _compute_at_4096(model_path: str, size: int, mtime_ns: int) -> int | None:
-    import os
+    """llama.cpp's compute buffer at 4,096 tokens, asked once per model file and build.
 
+    Asking means starting ``llama-fit-params`` (one to two seconds per model),
+    so the answer is kept on disk, keyed by the model file and the tool itself:
+    a changed file or an upgraded llama.cpp is asked again.
+    """
     from .compat import find_llama_binary
 
     exe = find_llama_binary("llama-fit-params")
     if not os.path.isfile(exe):
         return None
-    return llama_compute_buffer(exe, model_path, 4096)
+    tool = os.stat(exe)
+    key = f"{model_path}|{size}|{mtime_ns}|{tool.st_size}|{tool.st_mtime_ns}"
+    cache = _load_compute_cache()
+    if isinstance(cache.get(key), int):
+        return cache[key]
+    value = llama_compute_buffer(exe, model_path, 4096)
+    if value is not None:
+        cache[key] = value
+        kept = dict(list(cache.items())[-_COMPUTE_CACHE_ENTRIES:])
+        try:
+            path = _compute_cache_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(kept), encoding="utf-8")
+        except OSError:
+            pass
+    return value
 
 
 def llama_compute_buffer(fit_params_exe: str, model_path: str, ctx: int, ubatch: int = 512, timeout: int = 120) -> int | None:

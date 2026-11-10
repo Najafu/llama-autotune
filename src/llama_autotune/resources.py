@@ -289,8 +289,13 @@ def _topology_linux() -> CpuTopology | None:
     e_cpus = _read_cpu_list("/sys/devices/cpu_atom/cpus")
     if not p_cpus or not e_cpus:
         return CpuTopology(physical_cores=physical, logical_cores=logical, performance_cores=physical)
-    p_cores = {open(f"/sys/devices/system/cpu/cpu{c}/topology/core_id").read().strip() for c in p_cpus
-               if os.path.exists(f"/sys/devices/system/cpu/cpu{c}/topology/core_id")}
+    p_cores = set()
+    for cpu in p_cpus:
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/core_id") as f:
+                p_cores.add(f.read().strip())
+        except OSError:
+            pass
     return CpuTopology(
         physical_cores=physical, logical_cores=logical,
         performance_cores=len(p_cores) or physical - len(e_cpus),
@@ -323,9 +328,14 @@ def measure_bandwidth(size_mib: int = 128, repeats: int = 6, threads: int = 1) -
         repeats: Number of copies; the fastest one counts.
         threads: Copy threads for the multi-thread pass (capped at 16).
 
+    The buffers never take more than a quarter of the RAM free right now:
+    the test must not push a PC that is short of memory into its page file.
+
     Returns:
         Bandwidth in GB/s, or 0.0 if the buffers cannot be allocated.
     """
+    quarter_mib = psutil.virtual_memory().available // (4 * MIB)
+    size_mib = max(16, min(size_mib, quarter_mib // 2))  # two buffers
     n = size_mib * MIB
     best = 0.0
     try:
@@ -340,9 +350,10 @@ def measure_bandwidth(size_mib: int = 128, repeats: int = 6, threads: int = 1) -
         if dt > 0:
             best = max(best, 2 * n / dt / 1e9)
     del src, dst
-    threads = min(threads, 16)
+    per_thread_mib = max(16, size_mib // 2)
+    threads = min(threads, 16, quarter_mib // (2 * per_thread_mib))
     if threads > 1:
-        best = max(best, _threaded_bandwidth(threads, max(32, size_mib // 2), repeats))
+        best = max(best, _threaded_bandwidth(threads, per_thread_mib, repeats))
     return round(best, 1)
 
 

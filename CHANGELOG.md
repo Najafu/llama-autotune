@@ -5,6 +5,91 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `models` command: every model tuned on this PC with all its measured
+  results (verdict, writing speed and gain, prompt speed, speed after a long
+  chat, settings, size, images), whether it fits in the RAM free right now,
+  and which llama.cpp build it was tuned on. `--fits-now` shows only what can
+  start now. `tune` now also saves the long-chat speed and the verdict.
+
+### Fixed
+
+Found in a review of the whole code base:
+
+- `launch -c 0` no longer slips past the memory plan (llama-server reads 0 as
+  the model's full context). Contexts below 256 tokens are refused.
+- `tune` no longer crashes when the settings test is stopped early (time
+  limit or memory watchdog) with only prompt results; the defaults are kept.
+- A damaged or half-downloaded GGUF is reported in plain words by every
+  command instead of a traceback, and a damaged header can no longer ask
+  for a huge allocation.
+- The speed `tune` reports after the long-chat flash attention test is no
+  longer rescaled when "auto" already meant the winning setting.
+- Model paths are stored as absolute paths, so `models` and `launch` find
+  them from any folder.
+- File names and commands are printed as plain text: square brackets in a
+  path no longer vanish or crash the output, and commands are not broken
+  into lines, so they can be copied.
+- The PC's id no longer includes the OS release, which changed with every
+  Linux kernel update and orphaned all tuned results. Results stored under
+  the old id are adopted automatically.
+- Ctrl+C during `tune`, `benchmark` or `search` stops llama-bench too (on
+  Windows it kept running hidden, at raised priority).
+- `launch --profile` checks the profile against the RAM free now.
+- `search`: `balanced` is now the geometric mean of writing and prompt
+  speed, `min_latency` the time to the first word; the grid stage covers
+  the whole range of each setting and can put every layer on the GPU; the
+  winner is re-measured against the baseline before it is kept; the speed
+  probe allows for loading a large model from a slow disk. `max_context` is
+  refused with a pointer to `launch -c max`: it was never searched.
+- `tune` confirms prompt threads (`-tb`) with three repetitions when there
+  is time, instead of trusting one screening run.
+- `models`: the "largest" model is ranked by total size (not the active
+  part of an MoE model), "older" means an older build, an unknown build is
+  not shown as b0, and one unreadable file no longer hides the others.
+
+### Security
+
+- `launch --profile` only accepts options llama-autotune itself writes; a
+  profile carrying anything else (a network address, a file to write) is
+  refused. `import` warns about such a profile.
+- llama.cpp is no longer looked for in the current folder.
+- Extra options that load a different model (`-m`, `--hf-repo` and the
+  like) are refused; secret values (`--api-key`, `--hf-token`) are used for
+  the start but never saved or shown.
+
+### Changed
+
+- `export` now writes the settings `tune` measured for a model
+  (`export profile.json --model model.gguf`); it used to write a profile
+  without any settings. `--hardware` and `--score` are gone.
+- Faster start: Optuna is only loaded by `search` (about 0.5 s less for
+  every other command), llama-fit-params answers are remembered between
+  runs, and llama.cpp's library is mapped instead of read to check a model
+  architecture.
+- The memory bandwidth test never takes more than a quarter of the RAM
+  free at that moment.
+- One parser for llama-bench output; `benchmark` reads JSONL like `tune`.
+
+### Removed
+
+- `multi_gpu.py` (fixed split ratios that nothing used).
+
+### Documentation
+
+- README and docs checked against the code: the example `tune` output in the
+  README is real output now, the `search` table no longer claims the number
+  of trials depends on the PC's speed, and the new refusals (damaged file,
+  context below 256, foreign profile options, a second model) are explained
+  in the troubleshooting page.
+- The README is now a short guide to installing and using llama-autotune. The
+  full documentation moved to `docs/`: getting started, commands, chat and
+  apps, troubleshooting and FAQ, how it works, and development, next to the
+  benchmark protocol.
+
 ## [0.5.0] - 2026-11-09
 
 Phase 2 (CPU tuning) of the next-generation design: measured tuning that

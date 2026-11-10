@@ -32,6 +32,13 @@ FRIENDLY_NAMES: dict[str, str] = {
     "seed": "--seed",
 }
 
+#: Options that choose what is loaded: launch plans memory for the model it
+#: was given, so a second model must not arrive through the back door.
+MODEL_FLAGS = frozenset({"-m", "--model", "-mu", "--model-url", "-hf", "-hfr", "--hf-repo", "-hff", "--hf-file",
+                         "-dr", "--docker-repo"})
+#: Options whose value is a secret: used for this start, never saved or shown.
+SECRET_FLAGS = frozenset({"--api-key", "-hft", "--hf-token"})
+
 _NUMBER = re.compile(r"^-?\d+(\.\d+)?$")
 
 
@@ -52,6 +59,16 @@ def _resolve(name: str, registry: FlagRegistry | None) -> str:
     close = difflib.get_close_matches(name if name.startswith("-") else "--" + name, known, n=1, cutoff=0.6)
     hint = f" Did you mean {close[0].rstrip('=')}?" if close else ""
     raise ExtraArgsError(f"This llama.cpp build has no option '{name}'.{hint}")
+
+
+def _spellings(flag: str, registry: FlagRegistry | None) -> set[str]:
+    spec = registry.get(flag) if registry else None
+    return set(spec.names) if spec else {flag}
+
+
+def is_secret(flag: str, registry: FlagRegistry | None) -> bool:
+    """True for an option whose value must not be stored or printed."""
+    return bool(_spellings(flag, registry) & SECRET_FLAGS)
 
 
 def parse_extra_args(tokens: list[str], registry: FlagRegistry | None) -> list[tuple[str, str | None]]:
@@ -75,6 +92,9 @@ def parse_extra_args(tokens: list[str], registry: FlagRegistry | None) -> list[t
             raise ExtraArgsError(f"Unexpected '{word}': write options as --temp 0.1 or temperature=0.1.")
         name, value = word.split("=", 1) if "=" in word else (word, None)
         flag = _resolve(name, registry)
+        if _spellings(flag, registry) & MODEL_FLAGS:
+            raise ExtraArgsError(f"Option '{name}' cannot be added: launch already loads the model you named, "
+                                 f"and its memory plan is for that model.")
         spec = registry.get(flag) if registry else None
         takes_value = spec.takes_value if spec else value is not None or (
             i + 1 < len(tokens) and (not tokens[i + 1].startswith("-") or bool(_NUMBER.match(tokens[i + 1]))))
@@ -139,6 +159,6 @@ def apply_over(args: list[str], pairs: list[tuple[str, str | None]],
     return out + to_args(pairs), replaced
 
 
-def describe(pairs: list[tuple[str, str | None]]) -> str:
-    """Short plain text for the launch output."""
-    return " ".join(to_args(pairs))
+def describe(pairs: list[tuple[str, str | None]], registry: FlagRegistry | None = None) -> str:
+    """Short plain text for the launch output; secret values are masked."""
+    return " ".join(to_args([(f, "***" if v is not None and is_secret(f, registry) else v) for f, v in pairs]))

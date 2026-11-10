@@ -458,3 +458,67 @@ def test_reported_speed_matches_the_saved_flash_attention(sim):
     assert rep.best_tps == pytest.approx(47.8 * 0.8, rel=0.02)
     assert not any(n.startswith("llama.cpp's default settings are already") for n in rep.notes)
     assert any(n.startswith("Apart from flash attention") for n in rep.notes)
+
+
+# ── models: what has been tuned on this PC ──────────────────────────
+
+def test_list_tuned_keeps_the_newest_result_per_model_fastest_first(tmp_path):
+    from llama_autotune.database import list_tuned
+    conn = connect(str(tmp_path / "db.sqlite"))
+    save_tuned(conn, "hw", "a", TunedSettings(config=SearchConfig(), generation_tps=9.0, model_path="a.gguf"))
+    save_tuned(conn, "hw", "a", TunedSettings(config=SearchConfig(threads=3), generation_tps=12.0,
+                                              depth_tps=10.3, depth=2048, verdict="Fast", model_path="a.gguf"))
+    save_tuned(conn, "hw", "b", TunedSettings(config=SearchConfig(), generation_tps=47.8, model_path="b.gguf"))
+    save_tuned(conn, "other-pc", "c", TunedSettings(config=SearchConfig(), generation_tps=99.0))
+    rows = list_tuned(conn, "hw")
+    assert [r.model_path for r in rows] == ["b.gguf", "a.gguf"]
+    assert rows[1].config.threads == 3 and rows[1].depth_tps == 10.3 and rows[1].verdict == "Fast"
+
+
+def test_models_command_lists_everything_measured(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+    from llama_autotune import cli
+    from llama_autotune.database import get_session
+    from llama_autotune.models import HardwareInfo
+    from llama_autotune.resources import MemoryStatus
+    monkeypatch.setattr(cli, "detect_capabilities", lambda: Capabilities())
+    monkeypatch.setattr(cli, "detect_hardware", lambda caps=None: HardwareInfo())
+    monkeypatch.setattr(cli, "hardware_fingerprint", lambda hw: "hw")
+    monkeypatch.setattr(cli, "memory_status", lambda: MemoryStatus(total=8 * 1024**3, available=3000 * MIB))
+    conn = get_session()
+    save_tuned(conn, "hw", "m", TunedSettings(config=SearchConfig(threads=3, flash_attn=False),
+                                              generation_tps=12.9, baseline_tps=12.3, prompt_tps=95.4,
+                                              depth_tps=10.3, depth=2048, verdict="Fast", llama_build=11347,
+                                              model_path=str(tmp_path / "gone.gguf")))
+    conn.close()
+    out = CliRunner().invoke(cli.app, ["models"]).output
+    assert "gone" in out and "Fast" in out and "12.9 (+5%)" in out and "95.4" in out
+    assert "10.3 after 2,048 tokens of chat" in out and "3 threads, flash attention off" in out
+    assert "file missing" in out
+    assert "No models tuned" in CliRunner().invoke(cli.app, ["models", "--fits-now"]).output or \
+        "None of them fits" in CliRunner().invoke(cli.app, ["models", "--fits-now"]).output
+
+
+def test_screen_stopped_before_any_generation_result_keeps_the_defaults(sim):
+    """The watchdog or the time limit can stop the screen after a prompt test only."""
+    machine = SimMachine(_i3_speed)
+
+    def cut_short(model_path, base, lists, **kw):
+        result = machine(model_path, base, lists, **kw)
+        if "threads" in lists and "flash_attn" in lists:   # the screen
+            result.records = [r for r in result.records if r.kind == "pp"][:1]
+            result.error = "memory_guard_external"
+        return result
+
+    rep = sim(cut_short).run()
+    assert rep.status == "tuned" and rep.config.threads is None
+    assert rep.best_tps == pytest.approx(rep.baseline_tps)
+    assert any("defaults are kept" in n for n in rep.notes)
+
+
+def test_prompt_threads_when_the_winner_was_added_after_the_screen(sim):
+    """The best thread count can be one tried only in the confirmation: it has no prompt speed yet."""
+    hybrid = _hw(physical_cores=12, logical_cores=20, performance_cores=8, efficiency_cores=4,
+                 performance_threads=16)                        # screens 2, 4, 6, 8, 16 threads
+    rep = sim(SimMachine(lambda t, fa, rp: 10.0 - abs(t - 5)), hw=hybrid).run()
+    assert rep.status == "tuned" and rep.config.threads == 5

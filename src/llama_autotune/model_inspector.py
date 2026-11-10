@@ -39,6 +39,15 @@ _SCALAR_FORMATS = {
     GGUF_TYPE_INT64: "<q", GGUF_TYPE_FLOAT64: "<d",
 }
 
+class GGUFError(ValueError):
+    """The file starts like a GGUF but cannot be read: cut short or damaged."""
+
+
+# No real string (chat template, token) or tensor comes near these; a damaged
+# header can claim anything, and the claim must not be allocated.
+_MAX_STRING_BYTES = 64 * 1024 * 1024
+_MAX_DIMS = 8
+
 # Arrays longer than this are skipped and only their length is kept
 # (tokenizer vocabularies); per-layer arrays are far shorter.
 _MAX_KEPT_ARRAY = 4096
@@ -132,14 +141,24 @@ def read_gguf(path: str | Path) -> GGUFFile:
     Returns:
         A :class:`GGUFFile`. ``kv`` and ``tensors`` are empty when the
         file does not start with the GGUF magic number.
+
+    Raises:
+        GGUFError: The file is a GGUF but is cut short or damaged (an
+            unfinished download, usually).
     """
     st = os.stat(path)
     return _read_gguf_cached(os.path.abspath(str(path)), st.st_size, st.st_mtime_ns)
 
 
-@functools.lru_cache(maxsize=8)
+@functools.lru_cache(maxsize=32)
 def _read_gguf_cached(path: str, size: int, mtime_ns: int) -> GGUFFile:
-    return _read_gguf_file(path, size)
+    try:
+        return _read_gguf_file(path, size)
+    except (struct.error, ValueError, EOFError, OverflowError, MemoryError) as e:
+        if isinstance(e, GGUFError):
+            raise
+        raise GGUFError(f"{os.path.basename(path)} is not a complete GGUF file "
+                        f"(damaged, or a download that did not finish)") from e
 
 
 def _read_gguf_file(path: str, size: int) -> GGUFFile:
@@ -156,6 +175,8 @@ def _read_gguf_file(path: str, size: int) -> GGUFFile:
         for _ in range(n_tensors):
             name = _read_string(f)
             n_dims = struct.unpack("<I", f.read(4))[0]
+            if n_dims > _MAX_DIMS:
+                raise GGUFError(f"tensor with {n_dims} dimensions")
             dims = list(struct.unpack(f"<{n_dims}Q", f.read(8 * n_dims)))
             ggml_type, offset = struct.unpack("<IQ", f.read(12))
             gguf.tensors.append(TensorInfo(name, dims, ggml_type, offset))
@@ -176,7 +197,12 @@ def _read_gguf_header(path: str) -> dict[str, object]:
 
 def _read_string(f) -> str:
     length = struct.unpack("<Q", f.read(8))[0]
-    return f.read(length).decode("utf-8", errors="replace")
+    if length > _MAX_STRING_BYTES:
+        raise GGUFError(f"string of {length} bytes")
+    data = f.read(length)
+    if len(data) != length:
+        raise GGUFError("file ends inside a string")
+    return data.decode("utf-8", errors="replace")
 
 
 def _read_value(f) -> object:
@@ -451,6 +477,7 @@ def inspect_model(path: str | Path) -> ModelInfo:
 
     Raises:
         FileNotFoundError: If the file does not exist.
+        GGUFError: If the file is cut short or damaged.
     """
     path = str(path)
     gguf = read_gguf(path)

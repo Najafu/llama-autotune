@@ -222,6 +222,32 @@ class TuneReport:
         return self.best_tps / self.baseline_tps - 1 if self.baseline_tps else 0.0
 
 
+@dataclass
+class _Tuning:
+    """What the stages of one tuning run hand to each other."""
+
+    gate: GateDecision
+    base: SearchConfig  # llama.cpp's defaults plus the gate's choices: every test starts from it
+    n_prompt: int  # prompt test size; the screen may halve it to fit the time
+    n_confirm: int  # generation test size of the baseline and every confirmation, so they compare
+    baseline: Speed = field(default_factory=Speed)
+    pp: float = 0.0  # prompt speed of the defaults (five times the writing speed when not measured)
+    load_s: float = 1.0  # seconds one llama-bench process spends loading the model
+    lists: dict[str, list] = field(default_factory=dict)  # the settings screened and their values
+    screen: dict[Candidate, Speed] = field(default_factory=dict)
+    pool: dict[Candidate, Speed] = field(default_factory=dict)  # confirmed finalists, else the screen
+    spreads: list[float] = field(default_factory=list)  # run-to-run spreads seen so far
+    best: Candidate = Candidate(0)
+    best_speed: Speed = field(default_factory=Speed)
+    best_cfg: SearchConfig = field(default_factory=SearchConfig)
+    tg_noise: float = TG_NOISE_FLOOR
+    beats_defaults: bool = False
+    best_pp: float = 0.0  # prompt speed at the winner's thread count
+    threads_batch: int | None = None
+    tb_pp: float = 0.0  # prompt speed with ``threads_batch`` (0 when none was chosen)
+    config: SearchConfig = field(default_factory=SearchConfig)  # what will be saved
+
+
 class Tuner:
     """Measured CPU tuning for one model (see the module docstring)."""
 
@@ -373,27 +399,59 @@ class Tuner:
         loser = not winner
         if config.flash_attn == winner or score[winner] <= score[loser] * (1 + noise):
             return
+        # What the saved settings ran with when their speed was measured. Left
+        # at "auto", that is what llama-bench reported for the defaults, else
+        # the setting whose empty-chat speed is nearest to theirs.
+        current = config.flash_attn if config.flash_attn is not None else rep.baseline.flash_attn
+        if current is None and empty:
+            current = min(empty, key=lambda fa: abs(empty[fa] - rep.best_tps))
         config.flash_attn = winner
         note = f"Flash attention {'on' if winner else 'off'}: {by_fa[winner] / by_fa[loser] - 1:.0%} faster after " \
                f"{rep.depth:,} tokens of chat"
         if empty:
             note += f", {empty[winner] / empty[loser] - 1:+.0%} in an empty one"
             # The reported speed is for the settings that are saved (Granite MoE: 47.8 -> about 38).
-            rep.best_tps *= empty[winner] / empty[loser]
-            rep.verdict = verdict(rep.best_tps)
+            # When "auto" already meant the winner, the setting is only pinned and the speed stands.
+            if current != winner:
+                rep.best_tps *= empty[winner] / empty[loser]
+                rep.verdict = verdict(rep.best_tps)
         rep.notes = ["Apart from flash attention, llama.cpp's default settings are the fastest on this PC."
                      if n.startswith("llama.cpp's default settings are already") else n for n in rep.notes]
         rep.notes.append(note + ".")
 
     def _run_stages(self, rep: TuneReport) -> None:
+        t = self._prepare(rep)
+        if t is None or not self._measure_defaults(rep, t) or not self._screen(rep, t):
+            return
+        self._confirm(t)
+        self._compare_with_defaults(rep, t)
+        self._choose_prompt_threads(t)
+        t.config = t.base.model_copy(update={"threads": t.best.threads, "threads_batch": t.threads_batch,
+                                             "flash_attn": t.best.flash_attn})
+        if t.best.repack is not None:
+            t.config.repack = t.best.repack
+        self._try_numa(rep, t)
+
+        # Time for the long-chat test is set aside first: speed in a long chat
+        # matters more than prompt batching, and it decides flash attention
+        # when that was screened.
+        depth = min(t.gate.ctx // 2, 2048)
+        one_depth_s = depth / (t.tb_pp or t.best_pp or t.pp) * 2 if depth >= 512 else 0.0
+        compare_fa = "flash_attn" in t.lists
+        self._choose_ubatch(rep, t, reserve_s=2 * (2 if compare_fa else 1) * one_depth_s)
+        self._settle(rep, t)
+        self._long_chat(rep, t, depth, one_depth_s, compare_fa)
+
+    def _prepare(self, rep: TuneReport) -> _Tuning | None:
+        """Gate, warnings and prediction; None when there is nothing to measure."""
         if architecture_supported(self.caps, self.model.architecture) is False:
             rep.status = "unsupported"
             rep.error = update_llama_advice(self.model.architecture, self.caps.build.build_number)
-            return
+            return None
         gate = rep.gate or self.plan()
         if not gate.fits:
             rep.status, rep.verdict = "wont_fit", "Won't fit"
-            return
+            return None
         self.preflight()
 
         self.say("Measuring memory speed...")
@@ -407,7 +465,7 @@ class Tuner:
             rep.status = "prediction_only"
             rep.verdict = verdict(rep.predicted_tps)
             rep.notes.append(f"Predicted {rep.predicted_tps:.2f} tokens/s: too slow to test within the time limit.")
-            return
+            return None
 
         # Every run at above-normal priority, as launch uses: the same speed
         # the user gets, and far steadier while other programs run (E3).
@@ -416,11 +474,12 @@ class Tuner:
         base.ctx_size = None
         pred = rep.predicted_tps or 4.0
         _, n_confirm = self._sizes(pred)
-        n_prompt = 64 if pred < USABLE_TPS else 128
+        return _Tuning(gate=gate, base=base, n_prompt=64 if pred < USABLE_TPS else 128, n_confirm=n_confirm)
 
-        # 1. Baseline with llama.cpp's defaults: calibration and the bar to beat.
+    def _measure_defaults(self, rep: TuneReport, t: _Tuning) -> bool:
+        """Stage 1. llama.cpp's defaults: the calibration and the bar to beat."""
         self.say("Measuring llama.cpp's default settings...")
-        first = self._run(base, n_prompt=n_prompt, n_gen=n_confirm, repetitions=2)
+        first = self._run(t.base, n_prompt=t.n_prompt, n_gen=t.n_confirm, repetitions=2)
         speeds = collect(first.records)
         if not speeds or not any(s.tg for s in speeds.values()):
             if first.error == "unsupported_arch":
@@ -429,60 +488,75 @@ class Tuner:
                 rep.warnings.clear()
             else:
                 rep.error = first.error or "failed"
-            return
+            return False
         rep.baseline, b = next((k, v) for k, v in speeds.items() if v.tg)
+        t.baseline = b
         rep.baseline_tps, rep.baseline_pp = b.tg, b.pp
         rep.noise = min(MAX_NOISE, max(TG_NOISE_FLOOR, 2 * b.tg_spread))
         if rep.predicted_tps:
             rep.efficiency = b.tg / (rep.predicted_tps / DEFAULT_EFFICIENCY)
-        n_screen, _ = self._sizes(b.tg)  # confirm keeps the baseline's size, so the two compare
-        pp = b.pp or b.tg * 5
-        load_s = max(1.0, first.elapsed - 3 * (n_prompt / pp + n_confirm / b.tg))
+        t.pp = b.pp or b.tg * 5
+        t.load_s = max(1.0, first.elapsed - 3 * (t.n_prompt / t.pp + t.n_confirm / b.tg))
+        return True
 
-        # 2. Screen: every candidate once, in one process.
+    def _screen(self, rep: TuneReport, t: _Tuning) -> bool:
+        """Stage 2. Every candidate once, in one process; False when nothing could be ranked."""
+        b = t.baseline
+        n_screen, _ = self._sizes(b.tg)  # confirm keeps the baseline's size, so the two compare
         lists: dict[str, list] = {"threads": thread_candidates(self.hw)}
-        if gate.cache_type == "f16":  # a quantized KV cache requires flash attention on
+        if t.gate.cache_type == "f16":  # a quantized KV cache requires flash attention on
             lists["flash_attn"] = [False, True]
-        if gate.repack and self.caps.bench is not None and self.caps.bench.has("--repack") \
+        if t.gate.repack and self.caps.bench is not None and self.caps.bench.has("--repack") \
                 and repack_copy_bytes(self.model, self.hw.isa_tier or "avx2", tensor_sizes_of(self.model_path)):
             lists["repack"] = [False, True]
 
         def estimate(ls: dict[str, list], n_gen: int, n_pp: int, reps: int) -> float:
             n = math.prod(len(v) for v in ls.values())
             loads = len(ls.get("repack", [None]))
-            return n * ((reps + 1) * n_pp / pp + reps * n_gen / b.tg + 0.5) + loads * load_s
+            return n * ((reps + 1) * n_pp / t.pp + reps * n_gen / b.tg + 0.5) + loads * t.load_s
 
+        # Too much for the time left: first smaller tests, then no repacking
+        # test, then fewer thread counts (the ones furthest from the default).
         share = 0.4 * self._remaining()
-        while estimate(lists, n_screen, n_prompt, 1) > share:
-            if n_prompt > 32 or n_screen > 8:
-                n_prompt, n_screen = max(32, n_prompt // 2), max(8, n_screen // 2)
+        while estimate(lists, n_screen, t.n_prompt, 1) > share:
+            if t.n_prompt > 32 or n_screen > 8:
+                t.n_prompt, n_screen = max(32, t.n_prompt // 2), max(8, n_screen // 2)
             elif "repack" in lists:
                 del lists["repack"]
             elif len(lists["threads"]) > 2:
-                t = lists["threads"]
-                far = max(t, key=lambda x: abs(x - rep.baseline.threads))
-                lists["threads"] = [x for x in t if x != far]
+                threads = lists["threads"]
+                far = max(threads, key=lambda x: abs(x - rep.baseline.threads))
+                lists["threads"] = [x for x in threads if x != far]
             else:
                 break
         n_cand = math.prod(len(v) for v in lists.values())
         self.say(f"Testing {n_cand} combinations of settings "
-                 f"(about {_minutes(estimate(lists, n_screen, n_prompt, 1))})...")
-        screen = collect(self._run(base, lists, n_prompt=n_prompt, n_gen=n_screen, repetitions=1).records)
-        if not screen:
+                 f"(about {_minutes(estimate(lists, n_screen, t.n_prompt, 1))})...")
+        t.lists = lists
+        t.screen = collect(self._run(t.base, lists, n_prompt=t.n_prompt, n_gen=n_screen, repetitions=1).records)
+        # A run stopped early (time limit, memory watchdog) can leave prompt
+        # results only: without a generation speed there is nothing to rank.
+        if not any(s.tg for s in t.screen.values()):
             rep.status, rep.verdict = "tuned", verdict(rep.baseline_tps)
-            rep.config, rep.best_tps, rep.best_pp = base, rep.baseline_tps, rep.baseline_pp
+            rep.config, rep.best_tps, rep.best_pp = t.base, rep.baseline_tps, rep.baseline_pp
             rep.notes.append("The settings test failed, so llama.cpp's defaults are kept.")
-            return
+            return False
+        return True
 
-        # 3. Confirm the best third and anything within screening noise of the
-        #    leader, plus untested thread counts next to it. Candidates that
-        #    share a repacking value run in one process (one model load).
+    def _confirm(self, t: _Tuning) -> None:
+        """Stage 3. Three repetitions for the finalists; picks the winner.
+
+        The finalists are the best third and anything within screening noise
+        of the leader, plus untested thread counts next to it. Candidates
+        that share a repacking value run in one process (one model load).
+        """
+        screen = t.screen
         ranked = sorted((k for k in screen if screen[k].tg), key=lambda k: -screen[k].tg)
         leader = ranked[0]
         cut = max(2, math.ceil(len(ranked) / 3))
         finalists = [k for i, k in enumerate(ranked)
                      if i < cut or screen[k].tg >= screen[leader].tg * (1 - SCREEN_NOISE)][:MAX_FINALISTS]
-        extra = refine_threads(lists["threads"], leader.threads)
+        extra = refine_threads(t.lists["threads"], leader.threads)
         by_repack: dict[bool | None, list[Candidate]] = {}
         for k in finalists:
             by_repack.setdefault(k.repack, []).append(k)
@@ -492,134 +566,153 @@ class Tuner:
                 break
             threads = sorted({k.threads for k in ks} | (set(extra) if rp == leader.repack else set()))
             fas = sorted({k.flash_attn for k in ks}, key=str)
-            cfg = base.model_copy(update={"repack": rp if rp is not None else base.repack})
+            cfg = t.base.model_copy(update={"repack": rp if rp is not None else t.base.repack})
             self.say(f"Confirming {len(threads) * len(fas)} finalist(s) with 3 repetitions...")
             confirm_lists: dict[str, list] = {"threads": threads}
-            if "flash_attn" in lists:
+            if "flash_attn" in t.lists:
                 confirm_lists["flash_attn"] = fas
-            res = self._run(cfg, confirm_lists, n_gen=n_confirm, repetitions=3)
+            res = self._run(cfg, confirm_lists, n_gen=t.n_confirm, repetitions=3)
             confirmed.update(collect(res.records))
-        pool = confirmed or screen
+        t.pool = confirmed or screen
 
-        spreads = [s.tg_spread for s in pool.values() if s.tg_spread] + [b.tg_spread]
-        tg_noise = min(MAX_NOISE, max(TG_NOISE_FLOOR, 2 * median(spreads)))
-        best = pick(pool, tg_noise) or leader
-        best_speed = pool[best]
-        best_cfg = base.model_copy(update={"threads": best.threads, "flash_attn": best.flash_attn})
-        if best.repack is not None:
-            best_cfg.repack = best.repack
+        t.spreads = [s.tg_spread for s in t.pool.values() if s.tg_spread] + [t.baseline.tg_spread]
+        t.tg_noise = min(MAX_NOISE, max(TG_NOISE_FLOOR, 2 * median(t.spreads)))
+        t.best = pick(t.pool, t.tg_noise) or leader
+        t.best_speed = t.pool[t.best]
+        t.best_cfg = t.base.model_copy(update={"threads": t.best.threads, "flash_attn": t.best.flash_attn})
+        if t.best.repack is not None:
+            t.best_cfg.repack = t.best.repack
 
-        # Final check against the defaults. Alternating short runs (defaults,
-        # winner, defaults, winner...) expose both to the same disturbances;
-        # on the busy test PC sequential runs judged the same +8-21% gain
-        # anywhere from -3% to +22%, alternating ones +8% to +21% (E2).
-        duel = self._duel(base, best_cfg, n_confirm, load_s)
+    def _compare_with_defaults(self, rep: TuneReport, t: _Tuning) -> None:
+        """Does the winner beat llama.cpp's defaults by more than the noise?
+
+        Alternating short runs (defaults, winner, defaults, winner...) expose
+        both to the same disturbances; on the busy test PC sequential runs
+        judged the same +8-21% gain anywhere from -3% to +22%, alternating
+        ones +8% to +21% (E2).
+        """
+        duel = self._duel(t.base, t.best_cfg, t.n_confirm, t.load_s)
         if duel is not None:
-            d_med, gain, tg_noise = duel
+            d_med, gain, t.tg_noise = duel
             rep.drift = d_med / rep.baseline_tps - 1
             rep.baseline_tps = d_med
-            best_speed = Speed(tg=d_med * (1 + gain), pp=best_speed.pp)
-            beats_defaults = gain > tg_noise
+            t.best_speed = Speed(tg=d_med * (1 + gain), pp=t.best_speed.pp)
+            t.beats_defaults = gain > t.tg_noise
         else:  # no time for a duel: the defaults once more, averaged with the first run
             self.say("Re-checking llama.cpp's defaults...")
-            last = collect(self._run(base, n_gen=n_confirm, repetitions=2).records)
+            last = collect(self._run(t.base, n_gen=t.n_confirm, repetitions=2).records)
             again = next((v for v in last.values() if v.tg), None)
             if again is not None:
-                spreads.append(again.tg_spread)
+                t.spreads.append(again.tg_spread)
                 rep.drift = again.tg / rep.baseline_tps - 1
                 rep.baseline_tps = (rep.baseline_tps + again.tg) / 2
-            tg_noise = min(MAX_NOISE, max(TG_NOISE_FLOOR, 2 * median(spreads)))
-            beats_defaults = best_speed.tg > rep.baseline_tps * (1 + tg_noise)
-        rep.noise = tg_noise
-        if abs(rep.drift) > max(2 * tg_noise, 0.08):
+            t.tg_noise = min(MAX_NOISE, max(TG_NOISE_FLOOR, 2 * median(t.spreads)))
+            t.beats_defaults = t.best_speed.tg > rep.baseline_tps * (1 + t.tg_noise)
+        rep.noise = t.tg_noise
+        if abs(rep.drift) > max(2 * t.tg_noise, 0.08):
             rep.warnings.append(
                 f"Speed changed by {rep.drift:+.0%} during the test (another program, or heat): "
                 "run tune again when the PC is idle for more reliable results.")
 
-        # Prompt threads: kept only when they read prompts faster beyond the noise.
-        pp_pool = {k: v for k, v in screen.items() if (k.flash_attn, k.repack) == (best.flash_attn, best.repack)}
+    def _choose_prompt_threads(self, t: _Tuning) -> None:
+        """Prompt threads (``-tb``): kept only when they read prompts faster beyond the noise."""
+        best = t.best
+        pp_pool = {k: v for k, v in t.screen.items() if (k.flash_attn, k.repack) == (best.flash_attn, best.repack)}
         tb = pick(pp_pool, PP_NOISE_FLOOR, "pp")
-        best_pp = pp_pool.get(best, Speed()).pp
-        threads_batch, tb_pp = None, 0.0
-        if tb and tb.threads != best.threads and pp_pool[tb].pp > best_pp * (1 + PP_NOISE_FLOOR):
-            threads_batch, tb_pp = tb.threads, pp_pool[tb].pp
+        t.best_pp = pp_pool.get(best, Speed()).pp
+        if not (tb and tb.threads != best.threads and pp_pool[tb].pp > t.best_pp * (1 + PP_NOISE_FLOOR)):
+            return
+        t.threads_batch, t.tb_pp = tb.threads, pp_pool[tb].pp
+        # The screen measured each prompt speed once. Three repetitions of
+        # just these two thread counts decide, when there is time for them.
+        # (The winner may be a thread count added after the screen: no prompt speed yet.)
+        if 8 * t.n_prompt / (t.best_pp or pp_pool[tb].pp) < 0.1 * self._remaining():
+            self.say("Confirming the thread count for reading prompts...")
+            res = self._run(t.best_cfg, {"threads": sorted({best.threads, tb.threads})},
+                            n_prompt=t.n_prompt, repetitions=3)
+            by_t = {r.threads: r.median_ts for r in res.records if r.kind == "pp" and r.median_ts}
+            if len(by_t) == 2:
+                t.best_pp = by_t[best.threads]
+                if by_t[tb.threads] > t.best_pp * (1 + PP_NOISE_FLOOR):
+                    t.tb_pp = by_t[tb.threads]
+                else:
+                    t.threads_batch, t.tb_pp = None, 0.0
 
-        config = base.model_copy(update={"threads": best.threads, "threads_batch": threads_batch,
-                                         "flash_attn": best.flash_attn})
-        if best.repack is not None:
-            config.repack = best.repack
+    def _try_numa(self, rep: TuneReport, t: _Tuning) -> None:
+        """Stage 4. Multi-socket machines: spread memory over the sockets?"""
+        if self.hw.numa_nodes <= 1 or self._remaining() <= 0.2 * self.budget_s:
+            return
+        self.say("Testing NUMA memory placement...")
+        numa = collect(self._run(t.config, n_gen=t.n_confirm, repetitions=3, numa="distribute").records)
+        n_speed = next((v.tg for v in numa.values() if v.tg), 0.0)
+        if n_speed > t.best_speed.tg * (1 + t.tg_noise):
+            t.config.numa = "distribute"
+            rep.notes.append(f"--numa distribute: {n_speed / t.best_speed.tg - 1:+.0%} on this multi-socket PC.")
+            t.best_speed = Speed(tg=n_speed, pp=t.best_speed.pp)
 
-        # 4. Multi-socket machines: spread memory over the sockets?
-        if self.hw.numa_nodes > 1 and self._remaining() > 0.2 * self.budget_s:
-            self.say("Testing NUMA memory placement...")
-            numa = collect(self._run(config, n_gen=n_confirm, repetitions=3, numa="distribute").records)
-            n_speed = next((v.tg for v in numa.values() if v.tg), 0.0)
-            if n_speed > best_speed.tg * (1 + tg_noise):
-                config.numa = "distribute"
-                rep.notes.append(f"--numa distribute: {n_speed / best_speed.tg - 1:+.0%} on this multi-socket PC.")
-                best_speed = Speed(tg=n_speed, pp=best_speed.pp)
-
-        # Time for step 6 is set aside first: speed in a long chat matters more
-        # than prompt batching, and it decides flash attention when screened.
-        depth = min(gate.ctx // 2, 2048)
-        one_depth_s = depth / (tb_pp or best_pp or pp) * 2 if depth >= 512 else 0.0
-        compare_fa = "flash_attn" in lists
-        depth_reserve = (2 if compare_fa else 1) * one_depth_s
-
-        # 5. ubatch for prompt processing, if time allows.
-        ubatches = [u for u in (128, 256, 512) if u <= gate.ubatch]
-        prompt_speed = tb_pp or best_pp or pp
+    def _choose_ubatch(self, rep: TuneReport, t: _Tuning, reserve_s: float) -> None:
+        """Stage 5. ubatch for reading prompts, when time allows beyond ``reserve_s``."""
+        ubatches = [u for u in (128, 256, 512) if u <= t.gate.ubatch]
+        prompt_speed = t.tb_pp or t.best_pp or t.pp
         n_pp = 512  # ubatch only matters for prompts longer than the smallest ubatch tested
-        if len(ubatches) > 1 and                 3 * len(ubatches) * n_pp / prompt_speed < 0.25 * (self._remaining() - 2 * depth_reserve):
-            self.say("Testing prompt batch sizes...")
-            cfg = config.model_copy(update={"threads": threads_batch or best.threads})
-            res = self._run(cfg, {"ubatch_size": ubatches}, n_prompt=n_pp, repetitions=2)
-            by_ub = {r.ubatch: r.median_ts for r in res.records if r.kind == "pp"}
-            if by_ub:
-                top = max(by_ub.values())
-                default = by_ub.get(gate.ubatch, 0.0)
-                chosen = gate.ubatch if default >= top * (1 - PP_NOISE_FLOOR) else max(by_ub, key=by_ub.get)
-                if chosen != gate.ubatch:
-                    config.ubatch_size = chosen
-                    rep.notes.append(f"ubatch {chosen}: prompts {top / default - 1:+.0%} faster."
-                                     if default else f"ubatch {chosen}.")
+        ubatch_s = 3 * len(ubatches) * n_pp / prompt_speed
+        if len(ubatches) <= 1 or ubatch_s >= 0.25 * (self._remaining() - reserve_s):
+            return
+        self.say("Testing prompt batch sizes...")
+        cfg = t.config.model_copy(update={"threads": t.threads_batch or t.best.threads})
+        res = self._run(cfg, {"ubatch_size": ubatches}, n_prompt=n_pp, repetitions=2)
+        by_ub = {r.ubatch: r.median_ts for r in res.records if r.kind == "pp"}
+        if not by_ub:
+            return
+        top = max(by_ub.values())
+        default = by_ub.get(t.gate.ubatch, 0.0)
+        chosen = t.gate.ubatch if default >= top * (1 - PP_NOISE_FLOOR) else max(by_ub, key=by_ub.get)
+        if chosen != t.gate.ubatch:
+            t.config.ubatch_size = chosen
+            rep.notes.append(f"ubatch {chosen}: prompts {top / default - 1:+.0%} faster."
+                             if default else f"ubatch {chosen}.")
 
-        # Never slower than the defaults: a win must clear the noise.
-        if not beats_defaults:
+    def _settle(self, rep: TuneReport, t: _Tuning) -> None:
+        """Write the result. Never slower than the defaults: a win must clear the noise."""
+        if not t.beats_defaults:
             rep.notes.append("llama.cpp's default settings are already the fastest on this PC "
                              "(differences were within measurement noise).")
             # ubatch was measured on its own (prompts only), so its win stays.
-            config = base.model_copy(update={"ubatch_size": config.ubatch_size})
-            best_speed = Speed(tg=rep.baseline_tps, pp=rep.baseline_pp)
-            if threads_batch and threads_batch != rep.baseline.threads \
-                    and tb_pp > rep.baseline_pp * (1 + PP_NOISE_FLOOR):
-                config.threads_batch = threads_batch
+            t.config = t.base.model_copy(update={"ubatch_size": t.config.ubatch_size})
+            t.best_speed = Speed(tg=rep.baseline_tps, pp=rep.baseline_pp)
+            if t.threads_batch and t.threads_batch != rep.baseline.threads \
+                    and t.tb_pp > rep.baseline_pp * (1 + PP_NOISE_FLOOR):
+                t.config.threads_batch = t.threads_batch
             else:
-                tb_pp = 0.0
-        rep.config = config
-        rep.best_tps = best_speed.tg
-        rep.best_pp = tb_pp or best_speed.pp or best_pp
+                t.tb_pp = 0.0
+        rep.config = t.config
+        rep.best_tps = t.best_speed.tg
+        rep.best_pp = t.tb_pp or t.best_speed.pp or t.best_pp
         rep.verdict = verdict(rep.best_tps)
         rep.status = "tuned"
 
-        # 6. Speed with a filled context. When flash attention was screened it
-        #    is compared here too: on a CPU it can tie in an empty context and
-        #    still cost 30-40% once the chat grows (llama.cpp b12228, Llama 3.2
-        #    1B: 9.3 vs 5.8 tokens/s after 2,048 tokens).
+    def _long_chat(self, rep: TuneReport, t: _Tuning, depth: int, one_depth_s: float, compare_fa: bool) -> None:
+        """Stage 6. Speed with a filled context.
+
+        When flash attention was screened it is compared here too: on a CPU
+        it can tie in an empty context and still cost 30-40% once the chat
+        grows (llama.cpp b12228, Llama 3.2 1B: 9.3 vs 5.8 tokens/s after
+        2,048 tokens).
+        """
         if compare_fa and 2 * one_depth_s >= 0.5 * self._remaining():
             compare_fa = False  # too little time left: measure the chosen setting only
-        if depth >= 512 and (2 if compare_fa else 1) * one_depth_s < 0.5 * self._remaining():
-            self.say(f"Checking speed after {depth:,} tokens of conversation...")
-            d_lists = {"flash_attn": [False, True]} if compare_fa else {}
-            records = self._run(config, d_lists, n_gen=max(8, n_confirm // 2), repetitions=1, n_depth=depth).records
-            by_fa = {r.flash_attn: r.median_ts for r in records if r.kind == "tg" and r.median_ts}
-            rep.depth = depth
-            if compare_fa and len(by_fa) == 2:
-                self._choose_flash_attn(rep, config, by_fa, pool, screen, tg_noise)
-            rep.depth_tps = by_fa.get(config.flash_attn) or max(by_fa.values(), default=0.0)
-            if rep.efficiency:
-                rep.predicted_depth_tps = predict_generation_tps(self.model, rep.bandwidth_gbs,
-                                                                 rep.efficiency, depth)
+        if depth < 512 or (2 if compare_fa else 1) * one_depth_s >= 0.5 * self._remaining():
+            return
+        self.say(f"Checking speed after {depth:,} tokens of conversation...")
+        d_lists = {"flash_attn": [False, True]} if compare_fa else {}
+        records = self._run(t.config, d_lists, n_gen=max(8, t.n_confirm // 2), repetitions=1, n_depth=depth).records
+        by_fa = {r.flash_attn: r.median_ts for r in records if r.kind == "tg" and r.median_ts}
+        rep.depth = depth
+        if compare_fa and len(by_fa) == 2:
+            self._choose_flash_attn(rep, t.config, by_fa, t.pool, t.screen, t.tg_noise)
+        rep.depth_tps = by_fa.get(t.config.flash_attn) or max(by_fa.values(), default=0.0)
+        if rep.efficiency:
+            rep.predicted_depth_tps = predict_generation_tps(self.model, rep.bandwidth_gbs, rep.efficiency, depth)
 
 
 def _minutes(seconds: float) -> str:

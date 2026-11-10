@@ -102,7 +102,9 @@ def _gpu_space(
 ) -> dict[str, ParamDef]:
     """Build the GPU-specific portion of the search space.
 
-    Currently only exposes the *n_gpu_layers* parameter.
+    Currently only exposes the *n_gpu_layers* parameter, in quarters of the
+    model's layers. The range ends exactly at the layer count, so putting
+    every layer on the GPU is always one of the values tried.
 
     Args:
         hw: Hardware information (currently unused but reserved).
@@ -114,9 +116,8 @@ def _gpu_space(
     """
     space = {}
     max_layers = min(model.n_layers, 200) if model.n_layers > 0 else 200
-    space["n_gpu_layers"] = ParamDef(
-        "n_gpu_layers", 1, max_layers, step=max(1, max_layers // 4)
-    )
+    step = max(1, max_layers // 4)
+    space["n_gpu_layers"] = ParamDef("n_gpu_layers", max_layers % step, max_layers, step=step)
     return space
 
 
@@ -176,8 +177,6 @@ def config_from_params(params: dict[str, Any], base: SearchConfig | None = None)
     Returns:
         A new ``SearchConfig`` with the supplied overrides applied.
     """
-    cfg = base.model_copy() if base is not None else SearchConfig()
-    for key, value in params.items():
-        if hasattr(cfg, key):
-            cfg = SearchConfig.model_validate({**cfg.model_dump(), key: value})
-    return cfg
+    cfg = base if base is not None else SearchConfig()
+    known = {k: v for k, v in params.items() if k in SearchConfig.model_fields}
+    return SearchConfig.model_validate({**cfg.model_dump(), **known})
